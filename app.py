@@ -8,95 +8,145 @@ from io import BytesIO
 from statsmodels.tsa.seasonal import seasonal_decompose
 from scipy import stats
 
-# Darts imports
+# --- DARTS IMPORTS ---
 from darts import TimeSeries
 from darts.models import (
     ExponentialSmoothing,
     LightGBMModel,
-    AutoARIMA,
     Theta,
     LinearRegressionModel,
-    NaiveDrift
+    Prophet,
+    ARIMA
 )
 from darts.metrics import mae, mse, rmse, mape
 from darts.utils.missing_values import fill_missing_values
+from darts.utils.utils import ModelMode, SeasonalityMode
 
-# Проверка Prophet
-PROPHET_AVAILABLE = False
+# AutoARIMA Check
+AUTOARIMA_AVAILABLE = False
 try:
-    from darts.models import Prophet
+    from darts.models import AutoARIMA
 
-    PROPHET_AVAILABLE = True
+    AUTOARIMA_AVAILABLE = True
 except ImportError:
     pass
 
-st.set_page_config(page_title="TS Master v4.0", layout="wide")
+st.set_page_config(page_title="TS Master v9.0", layout="wide")
 
 
-# --- ФУНКЦИИ ---
+# --- HELPERS ---
 
-def detect_seasonality_period(df_index):
-    """
-    Умное определение периода на основе индекса Pandas.
-    Возвращает (int Period, str Reasoning)
-    """
-    freq = pd.infer_freq(df_index)
-    if freq:
-        freq = freq.upper()
-        if 'M' in freq: return 12, "Месячные данные (Detected: Month)"
-        if 'Q' in freq: return 4, "Квартальные данные (Detected: Quarter)"
-        if 'H' in freq: return 24, "Часовые данные (Detected: Hour)"
-        if 'D' in freq: return 7, "Дневные данные (Default: Week)"
-        if 'W' in freq: return 52, "Недельные данные (Default: Year)"
-
-    # Fallback если частоту не поняли
-    if len(df_index) < 60: return 12, "Мало данных, предполагаем Месяцы"
-    return 7, "Частота не определена, предполагаем Недельный цикл"
+def get_safe_lags(data_len):
+    max_lags = int(data_len / 2) - 1
+    return min(12, max_lags) if max_lags > 1 else 1
 
 
-def check_seasonality(df, value_col, specified_period):
+def map_model_mode(val_str):
+    if val_str == "additive": return ModelMode.ADDITIVE
+    if val_str == "multiplicative": return ModelMode.MULTIPLICATIVE
+    if val_str == "none": return ModelMode.NONE
+    return ModelMode.NONE
+
+
+def map_seasonality_mode(val_str):
+    if val_str == "additive": return SeasonalityMode.ADDITIVE
+    if val_str == "multiplicative": return SeasonalityMode.MULTIPLICATIVE
+    return SeasonalityMode.ADDITIVE
+
+
+def check_seasonality(df, value_col, period):
     try:
-        # Используем период, который выбрала система или пользователь
-        period = int(specified_period)
-        if period >= len(df) // 2: period = 2
-
-        decomposition = seasonal_decompose(df[value_col], model='additive', period=period)
-
-        seasonal_var = np.var(decomposition.seasonal)
-        resid_var = np.var(decomposition.resid.dropna())
-
-        # Если сезонность объясняет больше вариации, чем шум
-        has_seasonality = seasonal_var > (resid_var * 0.1)
-        return has_seasonality, decomposition
+        if period < 2 or period > len(df) // 2: return False, None
+        decomposition = seasonal_decompose(df[value_col], model='additive', period=int(period))
+        return True, decomposition
     except:
         return False, None
 
 
-def detect_outliers(df, value_col, threshold=3):
-    z = np.abs(stats.zscore(df[value_col]))
-    outliers = df[z > threshold]
-    return outliers, len(outliers) > 0
+def safe_export_df(ts_obj, col_name='Value'):
+    try:
+        vals = ts_obj.values().flatten()
+        idx = ts_obj.time_index
+        return pd.DataFrame(data=vals, index=idx, columns=[col_name]).reset_index()
+    except:
+        return pd.DataFrame(columns=['Error'])
 
 
-# --- ИНТЕРФЕЙС ---
+# --- OPTUNA ENGINE ---
 
-st.title("🧠 Time Series Master v4.0 (AI + Stats)")
+def run_optimization(model_name, train, val, metric_func, period):
+    def objective(trial):
+        try:
+            m_tmp = None
+            if model_name == "ExponentialSmoothing":
+                tr_str = trial.suggest_categorical("trend", ["additive", "multiplicative", "none"])
+                se_str = trial.suggest_categorical("seasonal", ["additive", "multiplicative", "none"])
+                m_tmp = ExponentialSmoothing(
+                    trend=map_model_mode(tr_str),
+                    seasonal=map_model_mode(se_str),
+                    seasonal_periods=period
+                )
+            elif model_name == "Theta":
+                th = trial.suggest_float("theta", 0.1, 5.0)
+                mod_str = trial.suggest_categorical("mode", ["additive", "multiplicative"])
+                m_tmp = Theta(theta=th, season_mode=map_seasonality_mode(mod_str))
+            elif model_name == "LightGBM":
+                l = trial.suggest_int("lags", 4, 30)
+                lr = trial.suggest_float("learning_rate", 0.01, 0.3)
+                m_tmp = LightGBMModel(lags=l, learning_rate=lr, output_chunk_length=1, verbose=-1)
+            elif model_name == "LinearRegression":
+                l = trial.suggest_int("lags", 1, 40)
+                m_tmp = LinearRegressionModel(lags=l)
+            elif model_name == "Prophet":
+                sm = trial.suggest_categorical("sm", ["additive", "multiplicative"])
+                cp = trial.suggest_float("cp", 0.01, 0.5)
+                m_tmp = Prophet(seasonality_mode=sm, changepoint_prior_scale=cp)
 
-# 1. ЗАГРУЗКА
+            m_tmp.fit(train)
+            p = m_tmp.predict(len(val))
+            return metric_func(val, p)
+        except Exception:
+            return float('inf')
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=10)
+    bp = study.best_params
+
+    final_model = None
+    if model_name == "ExponentialSmoothing":
+        final_model = ExponentialSmoothing(
+            trend=map_model_mode(bp['trend']),
+            seasonal=map_model_mode(bp['seasonal']),
+            seasonal_periods=period
+        )
+    elif model_name == "Theta":
+        final_model = Theta(theta=bp['theta'], season_mode=map_seasonality_mode(bp['mode']))
+    elif model_name == "LightGBM":
+        final_model = LightGBMModel(lags=bp['lags'], learning_rate=bp['learning_rate'], output_chunk_length=1)
+    elif model_name == "LinearRegression":
+        final_model = LinearRegressionModel(lags=bp['lags'])
+    elif model_name == "Prophet":
+        final_model = Prophet(seasonality_mode=bp['sm'], changepoint_prior_scale=bp['cp'])
+
+    return final_model, bp
+
+
+# --- UI ---
+
+st.title("🛡️ TS Master v9.0 (Fixed)")
+
+# 1. DATA
 st.sidebar.header("1. Данные")
-uploaded_file = st.sidebar.file_uploader("Файл (CSV/XLSX)", type=['csv', 'xlsx'])
+uploaded_file = st.sidebar.file_uploader("CSV / XLSX", type=['csv', 'xlsx'])
 
 if uploaded_file:
-    # Чтение
     if uploaded_file.name.endswith('.csv'):
         df = pd.read_csv(uploaded_file)
     else:
         df = pd.read_excel(uploaded_file)
 
     cols = df.columns.tolist()
-
-    # Авто-выбор
-    date_guess = next((c for c in cols if 'date' in c.lower() or 'time' in c.lower() or 'month' in c.lower()), cols[0])
+    date_guess = next((c for c in cols if 'date' in c.lower() or 'time' in c.lower() or 'дата' in c.lower()), cols[0])
     target_guess = next((c for c in cols if c != date_guess and pd.api.types.is_numeric_dtype(df[c])),
                         cols[1] if len(cols) > 1 else cols[0])
 
@@ -106,251 +156,296 @@ if uploaded_file:
 
     try:
         df[date_col] = pd.to_datetime(df[date_col])
-        df = df.sort_values(by=date_col)
-        df = df.set_index(date_col)
-        df[target_col] = df[target_col].interpolate()  # Заполняем пропуски
+        df = df.sort_values(by=date_col).set_index(date_col)
+        df[target_col] = df[target_col].interpolate()
     except Exception as e:
-        st.error(f"Ошибка даты: {e}")
+        st.error(e)
         st.stop()
 
-    # --- 2. АНАЛИЗ ---
-    st.header("2. Анализ ряда")
+    # 2. PARAMS
+    st.header("2. Параметры")
 
-    # АВТО-ДЕТЕКТ СЕЗОННОСТИ
-    auto_period, period_reason = detect_seasonality_period(df.index)
+    col_h, col_p = st.columns(2)
+    horizon = col_h.number_input("📅 Горизонт прогноза (шагов)", 1, 1000, 12)
 
-    with st.expander("🔍 Настройки сезонности", expanded=True):
-        st.caption(f"Система определила: {period_reason}")
-        period_input = st.number_input("Период сезонности (шагов)", min_value=2, value=auto_period)
+    freq_detected = pd.infer_freq(df.index)
+    default_period = 12
+    if freq_detected and 'D' in freq_detected: default_period = 7
+    period_input = col_p.number_input("🔄 Период сезонности", 2, 365, default_period)
 
-    has_seasonality, decomposition = check_seasonality(df.reset_index(), target_col, specified_period=period_input)
-    outliers_df, has_outliers = detect_outliers(df.reset_index(), target_col)
+    has_seas, decomp = check_seasonality(df.reset_index(), target_col, period_input)
+    if decomp:
+        with st.expander("Показать график сезонности"):
+            fig_diag = make_subplots(rows=2, cols=1, shared_xaxes=True)
+            fig_diag.add_trace(go.Scatter(x=df.index, y=df[target_col], name='Fact'), row=1, col=1)
+            fig_diag.add_trace(go.Scatter(x=df.index, y=decomp.seasonal, name='Seasonality', line=dict(color='green')),
+                               row=2, col=1)
+            st.plotly_chart(fig_diag, width='stretch')
 
-    # График
-    fig_diag = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
-                             subplot_titles=("Исходный ряд", "Сезонность"))
-    fig_diag.add_trace(go.Scatter(x=df.index, y=df[target_col], name='Факт'), row=1, col=1)
-    if has_outliers:
-        fig_diag.add_trace(
-            go.Scatter(x=outliers_df[date_col], y=outliers_df[target_col], mode='markers', name='Выбросы',
-                       marker=dict(color='red', symbol='x')), row=1, col=1)
-    if decomposition:
-        fig_diag.add_trace(
-            go.Scatter(x=df.index, y=decomposition.seasonal, name='Сезонность', line=dict(color='green')), row=2, col=1)
-    st.plotly_chart(fig_diag, use_container_width=True)
-
-    # --- 3. МОДЕЛИРОВАНИЕ ---
+    # 3. MODEL SELECTION
     st.markdown("---")
-    st.header("3. Выбор модели")
+    c_algo, c_mode, c_met = st.columns(3)
 
-    c_h, c_m, c_opt = st.columns(3)
-    with c_h:
-        horizon = st.number_input("Горизонт прогноза", min_value=1, value=int(period_input))
-    with c_m:
-        # РАСШИРЕННЫЙ СПИСОК МОДЕЛЕЙ
-        model_opts = [
-            "ExponentialSmoothing (ETS)",
-            "AutoARIMA (Stats)",
-            "Theta (Stats)",
-            "LinearRegression (Trend)",
-            "LightGBM (ML)"
-        ]
-        if PROPHET_AVAILABLE: model_opts.append("Prophet (Facebook)")
+    opts = ["🏆 БИТВА МОДЕЛЕЙ", "ExponentialSmoothing", "ARIMA (Manual)", "Theta", "LinearRegression", "LightGBM",
+            "Prophet"]
+    if AUTOARIMA_AVAILABLE: opts.insert(2, "AutoARIMA")
 
-        model_name = st.selectbox("Алгоритм", model_opts)
-    with c_opt:
-        tuning_mode = st.radio("Режим настройки", ["Ручной (Manual)", "AutoML (Optuna)"])
+    model_name = c_algo.selectbox("Алгоритм", opts)
 
-    # ПАРАМЕТРЫ МОДЕЛЕЙ
+    # Flags
+    is_battle = "БИТВА" in model_name
+    is_manual_arima = "ARIMA (Manual)" in model_name
+
+    use_deep_battle = False
+    is_manual_mode = False  # Флаг для отображения ручных настроек
+
+    if is_battle:
+        use_deep_battle = c_mode.checkbox("Глубокая битва (Optuna)", value=False)
+    elif is_manual_arima:
+        is_manual_mode = True
+        c_mode.info("Ручной режим (Manual)")
+    else:
+        mode_select = c_mode.radio("Режим", ["Ручной (Manual)", "AutoML (Optuna)"])
+        if mode_select == "Ручной (Manual)":
+            is_manual_mode = True
+
+    metric_name = c_met.selectbox("Цель", ["MAE", "RMSE", "MSE", "MAPE"])
+    METRICS = {'MAE': mae, 'RMSE': rmse, 'MSE': mse, 'MAPE': mape}
+    metric_func = METRICS[metric_name]
+
+    # MANUAL PARAMS UI
     params = {}
-
-    with st.expander(f"🛠 Настройки: {model_name}", expanded=True):
-
-        # 1. EXPONENTIAL SMOOTHING
-        if "ExponentialSmoothing" in model_name:
-            if tuning_mode == "Ручной (Manual)":
+    if is_manual_mode and not is_battle:
+        with st.expander("🎛 Настройки вручную", expanded=True):
+            if "ARIMA (Manual)" in model_name:
+                c1, c2, c3 = st.columns(3)
+                p = c1.number_input("p", 0, 10, 1)
+                d = c2.number_input("d", 0, 2, 1)
+                q = c3.number_input("q", 0, 10, 1)
+                is_seas = st.checkbox("Seasonal?", value=True)
+                params['order'] = (p, d, q)
+                params['seas_order'] = (0, 1, 0, period_input) if is_seas else (0, 0, 0, 0)
+            elif "LightGBM" in model_name:
+                params['lags'] = st.slider("Lags", 1, 60, 12)
+                params['lr'] = st.number_input("LR", 0.01, 0.5, 0.1)
+            elif "LinearRegression" in model_name:
+                params['lags'] = st.slider("Lags", 1, 60, 12)
+            elif "Theta" in model_name:
+                params['theta'] = st.number_input("Theta", 0.0, 5.0, 2.0)
+            elif "Prophet" in model_name:
+                params['mode'] = st.selectbox("Mode", ["additive", "multiplicative"])
+                params['cps'] = st.slider("Flexibility", 0.01, 0.5, 0.05)
+            elif "ExponentialSmoothing" in model_name:
                 c1, c2 = st.columns(2)
-                trend_mode = c1.selectbox("Trend", ["Model Selects", "Additive", "Multiplicative", "None"])
-                seas_mode = c2.selectbox("Seasonal", ["Model Selects", "Additive", "Multiplicative", "None"])
+                t_str = c1.selectbox("Trend", ["additive", "multiplicative", "none"])
+                s_str = c2.selectbox("Seasonal", ["additive", "multiplicative", "none"])
+                params['trend'] = map_model_mode(t_str)
+                params['seasonal'] = map_model_mode(s_str)
 
-                # Преобразование в формат, понятный Darts (None или lowercase string)
-                params['trend'] = None if trend_mode == "Model Selects" else (
-                    None if trend_mode == "None" else trend_mode.lower())
-                params['seasonal'] = None if seas_mode == "Model Selects" else (
-                    None if seas_mode == "None" else seas_mode.lower())
-            else:
-                st.info("Optuna подберет тип тренда и сезонности.")
-
-        # 2. AUTO ARIMA
-        elif "AutoARIMA" in model_name:
-            st.info("AutoARIMA автоматически подбирает параметры (p,d,q). Это может занять время.")
-            # AutoARIMA почти не требует ручных настроек для базового использования
-
-        # 3. THETA
-        elif "Theta" in model_name:
-            if tuning_mode == "Ручной (Manual)":
-                theta_param = st.number_input("Theta Parameter (0=Linear, 2=Standard)", value=2.0)
-                params['theta'] = theta_param
-            else:
-                st.info("Optuna подберет параметр Theta.")
-
-        # 4. LINEAR REGRESSION
-        elif "LinearRegression" in model_name:
-            st.info("Строит линейный тренд + лаги. Хорошо для данных с явным ростом/падением.")
-            lags_lr = st.slider("Lags (учитывать прошлые N точек)", 1, 60, 12)
-            params['lags'] = lags_lr
-
-        # 5. LIGHTGBM
-        elif "LightGBM" in model_name:
-            st.warning(
-                "LightGBM плохо экстраполирует тренды. Используйте его для стационарных данных или уберите тренд.")
-            lags_input = st.slider("Lags", 1, 60, 12)
-            params['lags'] = lags_input
-            if tuning_mode == "Ручной (Manual)":
-                lr_input = st.number_input("Learning Rate", 0.001, 0.5, 0.05, step=0.01)
-                params['learning_rate'] = lr_input
-
-        # 6. PROPHET
-        elif "Prophet" in model_name:
-            if tuning_mode == "Ручной (Manual)":
-                col_p1, col_p2 = st.columns(2)
-                seasonality_mode = col_p1.selectbox("Seasonality Mode", ["additive", "multiplicative"])
-                # Добавлены новые настройки
-                changepoint_scale = col_p2.slider("Гибкость тренда (Changepoint Scale)", 0.001, 0.5, 0.05)
-
-                params['seasonality_mode'] = seasonality_mode
-                params['changepoint_prior_scale'] = changepoint_scale
-            else:
-                st.info("Optuna подберет режим сезонности и гибкость тренда.")
-
-    # --- ЗАПУСК ---
-    if st.button("🚀 Выполнить прогноз"):
-
-        # Подготовка данных
+    # --- EXECUTION ---
+    if st.button("🚀 ЗАПУСК"):
         ts = TimeSeries.from_dataframe(df.reset_index(), time_col=date_col, value_cols=target_col)
         ts = fill_missing_values(ts)
 
-        # Сплит
+        # Split
         val_len = horizon if horizon < len(ts) * 0.3 else int(len(ts) * 0.2)
         train, val = ts.split_before(len(ts) - val_len)
-        metric_func = mae
+        safe_lags = get_safe_lags(len(train))
 
-        model_obj = None
+        # === BATTLE MODE ===
+        if is_battle:
+            st.subheader("🥊 Арена Битвы")
 
-        with st.spinner('Обучение модели... (AutoARIMA может думать долго)'):
+            # Models List
+            models_list = [
+                ("ExponentialSmoothing", ExponentialSmoothing(seasonal_periods=period_input)),
+                ("Theta", Theta()),
+                ("LinearRegression", LinearRegressionModel(lags=safe_lags)),
+                ("LightGBM", LightGBMModel(lags=safe_lags, output_chunk_length=1, verbose=-1)),
+                ("Prophet", Prophet())
+            ]
 
-            # === AUTOML (OPTUNA) ===
-            if tuning_mode == "AutoML (Optuna)":
-                def objective(trial):
-                    m = None
-                    if "ExponentialSmoothing" in model_name:
-                        t = trial.suggest_categorical("trend", [None, "additive", "multiplicative"])
-                        s = trial.suggest_categorical("seasonal", [None, "additive", "multiplicative"])
-                        m = ExponentialSmoothing(trend=t, seasonal=s, seasonal_periods=period_input)
-                    elif "Theta" in model_name:
-                        th = trial.suggest_float("theta", 0, 5)
-                        m = Theta(theta=th,
-                                  season_mode=trial.suggest_categorical("mode", ["additive", "multiplicative"]))
-                    elif "LightGBM" in model_name:
-                        l = trial.suggest_int("lags", 4, 30)
-                        lr = trial.suggest_float("learning_rate", 0.01, 0.3)
-                        m = LightGBMModel(lags=l, learning_rate=lr, output_chunk_length=1, verbose=-1)
-                    elif "Prophet" in model_name:
-                        sm = trial.suggest_categorical("seasonality_mode", ["additive", "multiplicative"])
-                        cps = trial.suggest_float("changepoint_prior_scale", 0.001, 0.5)
-                        m = Prophet(seasonality_mode=sm, changepoint_prior_scale=cps)
-                    elif "LinearRegression" in model_name:
-                        l = trial.suggest_int("lags", 1, 30)
-                        m = LinearRegressionModel(lags=l)
-                    elif "AutoARIMA" in model_name:
-                        # AutoARIMA не тюним через Optuna, она сама тюнится
-                        m = AutoARIMA()
+            if AUTOARIMA_AVAILABLE:
+                # FIX: Removed suppress_warnings argument
+                try:
+                    aa = AutoARIMA(seasonal=True)
+                    models_list.append(("AutoARIMA", aa))
+                except:
+                    pass
 
-                    m.fit(train)
-                    p = m.predict(len(val))
-                    return mae(val, p)
+            results = []
+            progress_bar = st.progress(0)
+            status = st.empty()
 
+            for i, (m_name, default_model) in enumerate(models_list):
+                status.text(f"Боец: {m_name}...")
+                try:
+                    final_m = default_model
+                    p_info = "Default"
 
-                # Для AutoARIMA пропускаем Optuna
+                    if use_deep_battle and m_name != "AutoARIMA":
+                        final_m, best_p = run_optimization(m_name, train, val, metric_func, period_input)
+                        p_info = str(best_p)
+
+                    final_m.fit(train)
+                    pred = final_m.predict(len(val))
+
+                    # Calculate ALL metrics
+                    s_mae = mae(val, pred)
+                    s_rmse = rmse(val, pred)
+                    s_mse = mse(val, pred)
+                    s_mape = mape(val, pred)
+
+                    # Target metric for sorting
+                    target_score = metric_func(val, pred)
+
+                    results.append({
+                        "Model": m_name,
+                        "Score": target_score,  # For sorting
+                        "MAE": s_mae, "RMSE": s_rmse, "MSE": s_mse, "MAPE": s_mape,
+                        "Obj": final_m, "Pred": pred, "Params": p_info
+                    })
+                except Exception as e:
+                    pass
+                progress_bar.progress((i + 1) / len(models_list))
+
+            status.text("Готово!")
+
+            if results:
+                # Sort
+                res_df = pd.DataFrame(results).sort_values("Score")
+
+                # Leaderboard
+                st.dataframe(res_df[["Model", "MAE", "RMSE", "MSE", "MAPE", "Params"]].style.highlight_min(axis=0,
+                                                                                                           subset=[
+                                                                                                               "MAE",
+                                                                                                               "RMSE",
+                                                                                                               "MSE",
+                                                                                                               "MAPE"],
+                                                                                                           color='lightgreen'))
+
+                best = res_df.iloc[0]
+                st.success(f"🏆 Победитель по {metric_name}: **{best['Model']}**")
+
+                # Winner Metrics Display
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("MAE", f"{best['MAE']:.2f}")
+                m2.metric("RMSE", f"{best['RMSE']:.2f}")
+                m3.metric("MSE", f"{best['MSE']:.2f}")
+                m4.metric("MAPE", f"{best['MAPE']:.2f}%")
+
+                # Battle Plot
+                fig_b = go.Figure()
+                fig_b.add_trace(go.Scatter(x=val.time_index, y=val.values().flatten(), name="FACT",
+                                           line=dict(color='black', width=3)))
+                for res in results:
+                    is_best = (res['Model'] == best['Model'])
+                    op = 1.0 if is_best else 0.3
+                    width = 4 if is_best else 1
+                    fig_b.add_trace(
+                        go.Scatter(x=res['Pred'].time_index, y=res['Pred'].values().flatten(), name=res['Model'],
+                                   opacity=op, line=dict(width=width)))
+                st.plotly_chart(fig_b, width='stretch')
+
+                # FINAL FORECAST (REFIT)
+                st.subheader("🔮 Прогноз в будущее (Best Model)")
+                with st.spinner("Переобучение победителя..."):
+                    best_obj = best['Obj']
+                    best_obj.fit(ts)  # Refit on full data
+                    final_fcst = best_obj.predict(horizon)
+
+                # Final Plot
+                fig_f = go.Figure()
+                fig_f.add_trace(
+                    go.Scatter(x=ts.time_index, y=ts.values().flatten(), name="History", line=dict(color='gray')))
+                fig_f.add_trace(go.Scatter(x=final_fcst.time_index, y=final_fcst.values().flatten(), name="FORECAST",
+                                           line=dict(color='green', width=3)))
+                st.plotly_chart(fig_f, width='stretch')
+
+                # Export
+                b = BytesIO()
+                with pd.ExcelWriter(b, engine='openpyxl') as w:
+                    safe_export_df(ts, 'Hist').to_excel(w, sheet_name='Hist', index=False)
+                    safe_export_df(final_fcst, 'Fcst').to_excel(w, sheet_name='Fcst', index=False)
+                    res_df[["Model", "MAE", "RMSE", "MSE", "MAPE", "Params"]].to_excel(w, sheet_name='Leaderboard',
+                                                                                       index=False)
+                b.seek(0)
+                st.download_button("📥 Скачать результаты Битвы (XLSX)", b, "battle_results.xlsx")
+
+        # === SINGLE MODE ===
+        else:
+            m_obj = None
+            with st.spinner("Работаем..."):
+
+                # 1. AUTO ARIMA
                 if "AutoARIMA" in model_name:
-                    best_p = {}
+                    if AUTOARIMA_AVAILABLE:
+                        # FIX: Remove suppress_warnings
+                        m_obj = AutoARIMA(seasonal=True)
+                    else:
+                        st.error("No pmdarima")
+
+                # 2. OPTUNA
+                elif not is_manual_mode:
+                    m_obj, bp = run_optimization(model_name, train, val, metric_func, period_input)
+                    st.success(f"Optuna Best: {bp}")
+
+                # 3. MANUAL
                 else:
-                    study = optuna.create_study(direction="minimize")
-                    study.optimize(objective, n_trials=10)  # 10 попыток для скорости
-                    best_p = study.best_params
-                    st.success(f"Optuna нашла: {best_p}")
-
-                # Инициализация лучшей модели
-                if "ExponentialSmoothing" in model_name:
-                    model_obj = ExponentialSmoothing(trend=best_p.get('trend'), seasonal=best_p.get('seasonal'),
+                    if "ARIMA (Manual)" in model_name:
+                        # FIX: Explicit params access
+                        m_obj = ARIMA(p=params['order'][0], d=params['order'][1], q=params['order'][2],
+                                      seasonal_order=params['seas_order'])
+                    elif "LightGBM" in model_name:
+                        m_obj = LightGBMModel(lags=params['lags'], learning_rate=params['lr'], output_chunk_length=1)
+                    elif "LinearRegression" in model_name:
+                        m_obj = LinearRegressionModel(lags=params['lags'])
+                    elif "Theta" in model_name:
+                        m_obj = Theta(theta=params['theta'])
+                    elif "Prophet" in model_name:
+                        m_obj = Prophet(seasonality_mode=params['mode'], changepoint_prior_scale=params['cps'])
+                    elif "ExponentialSmoothing" in model_name:
+                        m_obj = ExponentialSmoothing(trend=params['trend'], seasonal=params['seasonal'],
                                                      seasonal_periods=period_input)
-                elif "Theta" in model_name:
-                    model_obj = Theta(theta=best_p.get('theta'), season_mode=best_p.get('mode', 'multiplicative'))
-                elif "LightGBM" in model_name:
-                    model_obj = LightGBMModel(lags=best_p['lags'], learning_rate=best_p['learning_rate'],
-                                              output_chunk_length=1)
-                elif "Prophet" in model_name:
-                    model_obj = Prophet(seasonality_mode=best_p['seasonality_mode'],
-                                        changepoint_prior_scale=best_p['changepoint_prior_scale'])
-                elif "LinearRegression" in model_name:
-                    model_obj = LinearRegressionModel(lags=best_p['lags'])
-                elif "AutoARIMA" in model_name:
-                    model_obj = AutoARIMA()
 
-            # === MANUAL MODE ===
-            else:
-                if "ExponentialSmoothing" in model_name:
-                    model_obj = ExponentialSmoothing(trend=params['trend'], seasonal=params['seasonal'],
-                                                     seasonal_periods=period_input)
-                elif "AutoARIMA" in model_name:
-                    model_obj = AutoARIMA()
-                elif "Theta" in model_name:
-                    model_obj = Theta(theta=params['theta'])
-                elif "LinearRegression" in model_name:
-                    model_obj = LinearRegressionModel(lags=params['lags'])
-                elif "LightGBM" in model_name:
-                    model_obj = LightGBMModel(lags=params['lags'], learning_rate=params['learning_rate'],
-                                              output_chunk_length=1)
-                elif "Prophet" in model_name:
-                    model_obj = Prophet(seasonality_mode=params['seasonality_mode'],
-                                        changepoint_prior_scale=params['changepoint_prior_scale'])
+                if m_obj:
+                    # Train & Val
+                    m_obj.fit(train)
+                    pv = m_obj.predict(len(val))
 
-            # ОБУЧЕНИЕ
-            model_obj.fit(train)
-            pred_val = model_obj.predict(len(val))
-            score = mae(val, pred_val)
+                    # Metrics
+                    s_mae = mae(val, pv)
+                    s_rmse = rmse(val, pv)
+                    s_mse = mse(val, pv)
+                    s_mape = mape(val, pv)
 
-            # ПРОГНОЗ В БУДУЩЕЕ
-            model_obj.fit(ts)  # Refit on full data
-            pred_future = model_obj.predict(horizon)
+                    # Display Metrics
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("MAE", f"{s_mae:.2f}")
+                    m2.metric("RMSE", f"{s_rmse:.2f}")
+                    m3.metric("MSE", f"{s_mse:.2f}")
+                    m4.metric("MAPE", f"{s_mape:.2f}%")
 
-            # ГРАФИК
-            fig_res = go.Figure()
-            fig_res.add_trace(
-                go.Scatter(x=ts.time_index, y=ts.values().flatten(), name="История", line=dict(color='gray')))
-            fig_res.add_trace(go.Scatter(x=val.time_index, y=pred_val.values().flatten(), name="Валидация",
-                                         line=dict(color='orange', dash='dot')))
-            fig_res.add_trace(go.Scatter(x=pred_future.time_index, y=pred_future.values().flatten(), name="ПРОГНОЗ",
-                                         line=dict(color='green', width=3)))
+                    # Full Forecast
+                    m_obj.fit(ts)
+                    pf = m_obj.predict(horizon)
 
-            st.plotly_chart(fig_res, use_container_width=True)
-            st.metric("Качество (MAE)", f"{score:.4f}")
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(x=ts.time_index, y=ts.values().flatten(), name="Hist", line=dict(color='gray')))
+                    fig.add_trace(go.Scatter(x=val.time_index, y=pv.values().flatten(), name="Val",
+                                             line=dict(color='orange', dash='dot')))
+                    fig.add_trace(go.Scatter(x=pf.time_index, y=pf.values().flatten(), name="Fcst",
+                                             line=dict(color='green', width=3)))
+                    st.plotly_chart(fig, width='stretch')
 
-            # ЭКСПОРТ
-            try:
-                df_hist = ts.pd_dataframe().reset_index()
-                df_pred = pred_future.pd_dataframe().reset_index()
-                df_pred.columns = [date_col, 'Forecast_Value']
-
-                buffer = BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df_hist.to_excel(writer, sheet_name='History', index=False)
-                    df_pred.to_excel(writer, sheet_name='Forecast', index=False)
-
-                buffer.seek(0)
-                st.download_button("📥 Скачать Excel", data=buffer, file_name="forecast_v4.xlsx")
-            except Exception as e:
-                st.error(f"Excel Error: {e}")
+                    # Export
+                    b = BytesIO()
+                    with pd.ExcelWriter(b, engine='openpyxl') as w:
+                        safe_export_df(ts, 'Hist').to_excel(w, sheet_name='Hist', index=False)
+                        safe_export_df(pf, 'Fcst').to_excel(w, sheet_name='Fcst', index=False)
+                    b.seek(0)
+                    st.download_button("📥 Скачать Excel", b, "fcst.xlsx")
 
 else:
-    st.info("Загрузите файл (CSV/XLSX)")
+    st.info("Загрузите CSV или Excel файл.")
