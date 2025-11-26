@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+darts
+optuna
+matplotlib
+plotly
+openpyxl
+statsmodels
+scikit-learn
+lightgbm
+pmdarima
+statsmodels
+prophet
+statsforecast
