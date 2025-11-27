@@ -13,3 +13,7 @@ pmdarima
 statsmodels
 prophet
 statsforecast
+pytorch-lightning
+pytorch-forecasting
+catboost
+kaleido
