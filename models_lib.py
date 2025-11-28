@@ -80,18 +80,14 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
                 params['daily_seasonality'] = trial.suggest_categorical('daily_seasonality', [True, False])
             
             elif model_name == "ExponentialSmoothing":
-                # Используем только поддерживаемые значения (без None)
-                trend_options = ['add', 'mul']
-                seasonal_options = ['add', 'mul']
+                # Для ExponentialSmoothing в darts параметры передаются напрямую
+                # Используем только поддерживаемые значения
+                trend_choice = trial.suggest_categorical('trend', ['add', 'mul'])
+                seasonal_choice = trial.suggest_categorical('seasonal', ['add', 'mul'])
                 
-                trend_choice = trial.suggest_categorical('trend', trend_options)
-                seasonal_choice = trial.suggest_categorical('seasonal', seasonal_options)
-                
-                # Убеждаемся, что значения правильных типов
-                params['trend'] = trend_choice if trend_choice in trend_options else 'add'
-                params['seasonal'] = seasonal_choice if seasonal_choice in seasonal_options else 'add'
-                
-                # Всегда задаем seasonal_periods для сезонности
+                # Передаем параметры напрямую (не как строки)
+                params['trend'] = trend_choice
+                params['seasonal'] = seasonal_choice
                 params['seasonal_periods'] = trial.suggest_int('seasonal_periods', 2, 24)
             
             elif model_name == "LightGBM":
