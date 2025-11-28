@@ -17,7 +17,7 @@ try:
     CATBOOST_AVAILABLE = True
 except ImportError:
     CATBOOST_AVAILABLE = False
-from darts.metrics import mae, mape, r2_score
+from darts.metrics import mae, mape, r2_score, rmse
 import optuna
 import warnings
 import inspect
@@ -61,6 +61,9 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
     elif metric.lower() == 'mse':
         from darts.metrics import mse
         metric_func = mse
+        direction = 'minimize'
+    elif metric.lower() == 'rmse':
+        metric_func = rmse
         direction = 'minimize'
     elif metric.lower() == 'r2':
         metric_func = r2_score

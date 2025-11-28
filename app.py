@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from darts import TimeSeries
-from darts.metrics import mae, mape, r2_score
+from darts.metrics import mae, mape, r2_score, rmse
 import warnings
 import plotly.graph_objects as go
 from models_lib import MODELS, train_model, optimize_hyperparameters
@@ -462,7 +462,7 @@ elif st.session_state.screen == "results":
                 )
 
                 if error or forecast is None:
-                    results_list.append({"Модель": name, "MAPE": np.nan, "MAE": np.nan, "R2": np.nan, "Гиперпараметры": error or "Неизвестная ошибка"})
+                    results_list.append({"Модель": name, "MAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Гиперпараметры": error or "Неизвестная ошибка"})
                     continue
 
                 # Получаем значения для проверки нулей
@@ -471,6 +471,7 @@ elif st.session_state.screen == "results":
                 mape_score = mape(val, forecast) if 0 not in val_values else np.nan
                 mae_score = mae(val, forecast)
                 r2_score_val = r2_score(val, forecast)
+                rmse_score = rmse(val, forecast)
                 
                 # Сохраняем информацию о гиперпараметрах
                 if best_params:
@@ -482,7 +483,7 @@ elif st.session_state.screen == "results":
                     except:
                         params_str = "По умолчанию"
                 
-                results_list.append({"Модель": name, "MAPE": mape_score, "MAE": mae_score, "R2": r2_score_val, "Гиперпараметры": params_str})
+                results_list.append({"Модель": name, "MAPE": mape_score, "MAE": mae_score, "RMSE": rmse_score, "R2": r2_score_val, "Гиперпараметры": params_str})
                 forecasts[name] = forecast
                 trained_models[name] = model
             
@@ -495,7 +496,16 @@ elif st.session_state.screen == "results":
                 st.error("Ни одна модель не смогла быть обучена."); st.stop()
 
             results_df = pd.DataFrame(results_list).set_index("Модель")
-            results_df = results_df.sort_values(by=st.session_state.ranking_metric, ascending=st.session_state.ranking_metric != "R2", na_position='last')
+            # Определяем, в каком порядке сортировать:
+            # для R2 и RMSE по убыванию (больше лучше), для остальных по возрастанию.
+            ascending_flag = False if st.session_state.ranking_metric == "R2" else True
+
+
+            results_df = results_df.sort_values(
+                by=st.session_state.ranking_metric,
+                ascending=ascending_flag,
+                na_position='last'
+            )
             
             # Создаем финальный прогноз лучшей модели на весь период
             best_model_name = results_df.dropna(subset=[st.session_state.ranking_metric]).index[0]
@@ -537,11 +547,11 @@ elif st.session_state.screen == "results":
     st.markdown(f"Ранжирование по: **{st.session_state.ranking_metric}**")
 
     def highlight_best(s):
-        is_min = s.name in ["MAE", "MAPE"]
+        is_min = s.name in ["MAE", "MAPE", "RMSE"]
         best_val = s.min() if is_min else s.max()
         return ['background-color: #28a745' if v == best_val else '' for v in s]
 
-    st.dataframe(results_df.style.apply(highlight_best, subset=["MAE", "MAPE", "R2"]).format({"MAPE": "{:.4f}", "MAE": "{:.4f}", "R2": "{:.4f}"}, na_rep="-"))
+    st.dataframe(results_df.style.apply(highlight_best, subset=["MAE", "MAPE", "RMSE", "R2"]).format({"MAPE": "{:.4f}", "MAE": "{:.4f}", "RMSE": "{:.4f}", "R2": "{:.4f}"}, na_rep="-"))
 
     # График прогнозов на тестовых данных
     st.subheader("📊 График прогнозов моделей на тестовых данных")
