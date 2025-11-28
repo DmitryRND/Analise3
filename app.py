@@ -332,18 +332,76 @@ elif st.session_state.screen == "results":
                 
                 # Создаем экзогенные переменные с той же частотой
                 try:
+                    # Убеждаемся, что экзогенные переменные имеют ту же частоту и временной индекс
                     if inferred_freq:
-                        future_covariates = TimeSeries.from_dataframe(df_sorted, time_col, extra_cols, fill_missing_dates=True, freq=inferred_freq).astype(np.float32)
+                        # Используем тот же временной диапазон и частоту, что и основной ряд
+                        # Важно: используем fill_missing_dates=True с freq для корректной работы
+                        # Сначала создаем без заполнения, чтобы проверить частоту
+                        try:
+                            future_covariates = TimeSeries.from_dataframe(
+                                df_sorted, 
+                                time_col, 
+                                extra_cols, 
+                                fill_missing_dates=True, 
+                                freq=inferred_freq
+                            ).astype(np.float32)
+                        except ValueError as e:
+                            # Если freq не работает, пробуем без явного freq
+                            future_covariates = TimeSeries.from_dataframe(
+                                df_sorted, 
+                                time_col, 
+                                extra_cols, 
+                                fill_missing_dates=True,
+                                freq=None
+                            ).astype(np.float32)
+                            # Устанавливаем freq вручную если возможно
+                            try:
+                                future_covariates = future_covariates.with_freq(inferred_freq) if inferred_freq else future_covariates
+                            except:
+                                pass
+                        
+                        # Дополняем экзогенные переменные для периода прогноза (используем последние значения)
+                        if len(future_covariates) < len(series) + n_forecast:
+                            from utils import _get_ts_values_and_index
+                            last_values, last_index = _get_ts_values_and_index(future_covariates)
+                            last_vals = last_values[-1] if len(last_values.shape) == 1 else last_values[-1, :]
+                            
+                            # Создаем дополнительные даты на основе частоты
+                            last_date = last_index[-1]
+                            if inferred_freq == 'D':
+                                freq_timedelta = pd.Timedelta(days=1)
+                            elif inferred_freq == 'M' or inferred_freq.startswith('M'):
+                                freq_timedelta = pd.Timedelta(days=30)
+                            elif inferred_freq == 'H':
+                                freq_timedelta = pd.Timedelta(hours=1)
+                            else:
+                                freq_timedelta = pd.Timedelta(days=1)
+                            
+                            needed_dates = len(series) + n_forecast - len(future_covariates)
+                            extended_dates = pd.date_range(start=last_date + freq_timedelta, periods=needed_dates, freq=inferred_freq)
+                            
+                            # Формируем значения (для нескольких экзогенных переменных)
+                            if len(last_vals.shape) == 0:
+                                extended_values = np.tile(last_vals, (len(extended_dates),))
+                            else:
+                                extended_values = np.tile(last_vals, (len(extended_dates), 1))
+                            
+                            extended_ts = TimeSeries.from_times_and_values(extended_dates, extended_values)
+                            future_covariates = future_covariates.concatenate(extended_ts)
                     else:
+                        # Без частоты просто создаем без заполнения пропусков
                         future_covariates = TimeSeries.from_dataframe(df_sorted, time_col, extra_cols, fill_missing_dates=False).astype(np.float32)
                 except Exception as e:
                     st.warning(f"Не удалось создать экзогенные переменные: {e}. Модели будут работать без них.")
                     future_covariates = None
 
             # Выбор моделей согласно требованиям
-            # Базовые модели (работают без экзогенных): ExponentialSmoothing, LinearRegression, Prophet, AutoARIMA, LightGBM, Theta
+            # Базовые модели (работают без экзогенных): ExponentialSmoothing, LinearRegression, Prophet, AutoARIMA, LightGBM, Theta, CatBoost
             # Сложные модели (только с экзогенными): FFT, N-BEATS и другие
             base_models = ["ExponentialSmoothing", "LinearRegression", "Prophet", "AutoARIMA", "LightGBM", "Theta"]
+            # Добавляем CatBoost, если он доступен
+            if "CatBoost" in MODELS:
+                base_models.append("CatBoost")
             advanced_models = ["FFT", "N-BEATS"]
             
             if extra_cols:
@@ -356,7 +414,11 @@ elif st.session_state.screen == "results":
             results_list, forecasts, trained_models, best_params_dict = [], {}, {}, {}
             total_steps = len(models_to_run) * (2 if st.session_state.use_hyperopt else 1)
             current_step = 0
-            progress_bar = st.progress(0, text="Начинаем битву...")
+            
+            # Выводим индикатор прогресса на передний план
+            st.info("🔄 **Начинаем обучение моделей...**")
+            progress_bar = st.progress(0, text="⏳ Подготовка к обучению моделей...")
+            status_text = st.empty()
             
             for name, model_info in models_to_run.items():
                 # Проверка совместимости модели с экзогенными переменными
@@ -368,7 +430,9 @@ elif st.session_state.screen == "results":
                 best_params = None
                 if st.session_state.use_hyperopt:
                     current_step += 1
-                    progress_bar.progress(current_step / total_steps, text=f"Подбор гиперпараметров: {name}")
+                    progress = current_step / total_steps
+                    progress_bar.progress(progress, text=f"🔍 Подбор гиперпараметров: {name}")
+                    status_text.info(f"**Текущий этап:** Подбор гиперпараметров для модели {name} ({current_step}/{total_steps})")
                     best_params, opt_error = optimize_hyperparameters(
                         model_name=name,
                         train_series=train,
@@ -385,7 +449,9 @@ elif st.session_state.screen == "results":
                 
                 # Обучение модели
                 current_step += 1
-                progress_bar.progress(current_step / total_steps, text=f"Обучается: {name}")
+                progress = current_step / total_steps
+                progress_bar.progress(progress, text=f"🚀 Обучается: {name}")
+                status_text.info(f"**Текущий этап:** Обучение модели {name} ({current_step}/{total_steps})")
                 
                 forecast, model, error = train_model(
                     model_name=name, 
@@ -421,6 +487,8 @@ elif st.session_state.screen == "results":
                 trained_models[name] = model
             
             progress_bar.empty()
+            status_text.empty()
+            st.success("✅ Обучение всех моделей завершено!")
 
             if not results_list:
                 st.error("Ни одна модель не смогла быть обучена."); st.stop()

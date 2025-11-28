@@ -11,6 +11,12 @@ from darts.models import (
     LinearRegressionModel,
     NBEATSModel,
 )
+# Пробуем импортировать CatBoostModel, если доступен
+try:
+    from darts.models import CatBoostModel
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
 from darts.metrics import mae, mape, r2_score
 import optuna
 import warnings
@@ -74,19 +80,43 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
                 params['daily_seasonality'] = trial.suggest_categorical('daily_seasonality', [True, False])
             
             elif model_name == "ExponentialSmoothing":
-                params['trend'] = trial.suggest_categorical('trend', ['add', 'mul', None])
-                params['seasonal'] = trial.suggest_categorical('seasonal', ['add', 'mul', None])
-                if params['seasonal']:
-                    params['seasonal_periods'] = trial.suggest_int('seasonal_periods', 2, 24)
+                # Используем только поддерживаемые значения (без None)
+                trend_options = ['add', 'mul']
+                seasonal_options = ['add', 'mul']
+                
+                trend_choice = trial.suggest_categorical('trend', trend_options)
+                seasonal_choice = trial.suggest_categorical('seasonal', seasonal_options)
+                
+                # Убеждаемся, что значения правильных типов
+                params['trend'] = trend_choice if trend_choice in trend_options else 'add'
+                params['seasonal'] = seasonal_choice if seasonal_choice in seasonal_options else 'add'
+                
+                # Всегда задаем seasonal_periods для сезонности
+                params['seasonal_periods'] = trial.suggest_int('seasonal_periods', 2, 24)
             
             elif model_name == "LightGBM":
                 params['n_estimators'] = trial.suggest_int('n_estimators', 50, 500)
                 params['max_depth'] = trial.suggest_int('max_depth', 3, 15)
                 params['learning_rate'] = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
                 params['lags'] = trial.suggest_int('lags', forecast_horizon, min(forecast_horizon * 4, len(train_series) - forecast_horizon))
+                if future_covariates is not None:
+                    lag_val = trial.suggest_int('lags_future_covariates', 1, min(forecast_horizon, len(train_series) - forecast_horizon))
+                    params['lags_future_covariates'] = tuple(range(1, lag_val + 1))
             
             elif model_name == "LinearRegression":
                 params['lags'] = trial.suggest_int('lags', forecast_horizon, min(forecast_horizon * 4, len(train_series) - forecast_horizon))
+                if future_covariates is not None:
+                    lag_val = trial.suggest_int('lags_future_covariates', 1, min(forecast_horizon, len(train_series) - forecast_horizon))
+                    params['lags_future_covariates'] = tuple(range(1, lag_val + 1))
+            
+            elif model_name == "CatBoost":
+                params['iterations'] = trial.suggest_int('iterations', 50, 500)
+                params['depth'] = trial.suggest_int('depth', 3, 10)
+                params['learning_rate'] = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
+                params['lags'] = trial.suggest_int('lags', forecast_horizon, min(forecast_horizon * 4, len(train_series) - forecast_horizon))
+                if future_covariates is not None:
+                    lag_val = trial.suggest_int('lags_future_covariates', 1, min(forecast_horizon, len(train_series) - forecast_horizon))
+                    params['lags_future_covariates'] = tuple(range(1, lag_val + 1))
             
             elif model_name == "N-BEATS":
                 input_chunk = trial.suggest_int('input_chunk_length', max(1, forecast_horizon), min(len(train_series) - forecast_horizon - 1, forecast_horizon * 3))
@@ -162,13 +192,18 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
 
 
         # For LightGBM and LinearRegression, ensure output_chunk_length is set
-        if model_name in ["LightGBM", "LinearRegression"]:
+        if model_name in ["LightGBM", "LinearRegression", "CatBoost"]:
              final_params.setdefault('output_chunk_length', forecast_horizon)
              # These models also need lags (but can work without future_covariates)
              if 'lags' not in final_params or final_params['lags'] is None:
                  final_params['lags'] = min(forecast_horizon * 2, len(train_series) - forecast_horizon)
+             # Если используются future_covariates, нужно установить lags_future_covariates (должен быть tuple или list)
+             if future_covariates is not None:
+                 if 'lags_future_covariates' not in final_params or final_params['lags_future_covariates'] is None:
+                     lag_val = min(forecast_horizon, len(train_series) - forecast_horizon)
+                     final_params['lags_future_covariates'] = tuple(range(1, lag_val + 1)) if lag_val > 0 else (1,)
         
-        # Для LightGBM добавляем параметры, чтобы убрать предупреждения
+        # Для LightGBM и CatBoost добавляем параметры, чтобы убрать предупреждения и ускорить работу
         if model_name == "LightGBM":
              # Увеличиваем минимальное количество данных в листе для стабильности
              if len(train_series) < 100:
@@ -177,13 +212,26 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
                  min_leaf = max(5, len(train_series) // 50)
              final_params.setdefault('min_data_in_leaf', min_leaf)
              final_params.setdefault('min_sum_hessian_in_leaf', 1e-3)
-             # Убираем min_gain_to_split, так как это может вызывать предупреждения
+             # Отключаем verbose для ускорения
+             final_params.setdefault('verbose', -1)
+             # Ограничиваем количество деревьев для ускорения, если не задано явно
+             if 'n_estimators' not in final_params and 'num_iterations' not in final_params:
+                 final_params.setdefault('n_estimators', min(100, len(train_series) // 10))
+        
+        if model_name == "CatBoost":
+             # Не устанавливаем verbose здесь, так как он уже установлен в constructor
+             # Ограничиваем количество итераций для ускорения
+             if 'iterations' not in final_params:
+                 final_params.setdefault('iterations', min(100, len(train_series) // 10))
+             # Удаляем verbose из final_params, так как он уже в constructor
+             final_params.pop('verbose', None)
         
         # Для Prophet улучшаем сезонность на основе длины данных
         if model_name == "Prophet":
             try:
                 # Получаем значения для определения режима сезонности
-                ts_values = train_series.values().flatten() if hasattr(train_series, 'values') else train_series.data_array().values.flatten()
+                from utils import _get_ts_values_and_index
+                ts_values, _ = _get_ts_values_and_index(train_series)
                 
                 # Автоматически определяем сезонность на основе длины ряда
                 # Если данных больше 730 (примерно 2 года дневных данных) - включаем годовую сезонность
@@ -211,8 +259,13 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
         model = model_info['constructor'](**final_params)
 
         # --- INTELLIGENT FITTING ---
-        # LightGBM and LinearRegression can work with or without future_covariates
-        if model_name in ["LightGBM", "LinearRegression"]:
+        # FFT не поддерживает future_covariates вообще
+        if model_name == "FFT":
+            # FFT работает без экзогенных переменных в darts
+            model.fit(train_series)
+            forecast = model.predict(forecast_horizon)
+        # LightGBM, LinearRegression и CatBoost can work with or without future_covariates
+        elif model_name in ["LightGBM", "LinearRegression", "CatBoost"]:
             if future_covariates is not None:
                 if len(future_covariates) < len(train_series) + forecast_horizon:
                     return None, None, f"External factors for {model_name} are not long enough for the forecast horizon."
@@ -263,9 +316,10 @@ MODELS = {
         "default_params": get_model_default_params(Theta),
     },
     # FFT is best used with covariates, so we mark it as requiring them
+    # FFT не поддерживает экзогенные переменные в darts
     "FFT": {
         "constructor": FFT,
-        "requires_extras": True,
+        "requires_extras": False,  # FFT работает без экзогенных переменных
         "default_params": get_model_default_params(FFT),
     },
     "LightGBM": {
@@ -284,3 +338,11 @@ MODELS = {
         "default_params": get_model_default_params(NBEATSModel),
     },
 }
+
+# Добавляем CatBoost, если доступен
+if CATBOOST_AVAILABLE:
+    MODELS["CatBoost"] = {
+        "constructor": lambda **kwargs: CatBoostModel(random_state=42, verbose=False, **kwargs),
+        "requires_extras": False,  # Может работать без экзогенных переменных
+        "default_params": get_model_default_params(CatBoostModel),
+    }
