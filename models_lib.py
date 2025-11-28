@@ -22,6 +22,7 @@ import optuna
 import warnings
 import inspect
 import numpy as np
+from darts.utils.utils import ModelMode, SeasonalityMode
 
 # Suppress warnings for a cleaner output
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -80,14 +81,8 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
                 params['daily_seasonality'] = trial.suggest_categorical('daily_seasonality', [True, False])
             
             elif model_name == "ExponentialSmoothing":
-                # Для ExponentialSmoothing в darts параметры передаются напрямую
-                # Используем только поддерживаемые значения
-                trend_choice = trial.suggest_categorical('trend', ['add', 'mul'])
-                seasonal_choice = trial.suggest_categorical('seasonal', ['add', 'mul'])
-                
-                # Передаем параметры напрямую (не как строки)
-                params['trend'] = trend_choice
-                params['seasonal'] = seasonal_choice
+                params['trend'] = trial.suggest_categorical('trend', [ModelMode.ADDITIVE, ModelMode.MULTIPLICATIVE, ModelMode.NONE, None])
+                params['seasonal'] = trial.suggest_categorical('seasonal', [SeasonalityMode.ADDITIVE, SeasonalityMode.MULTIPLICATIVE, SeasonalityMode.NONE, None])
                 params['seasonal_periods'] = trial.suggest_int('seasonal_periods', 2, 24)
             
             elif model_name == "LightGBM":
@@ -249,7 +244,33 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             except:
                 # В случае ошибки используем значения по умолчанию
                 pass
+        
+        if model_name == "ExponentialSmoothing":
+            tr = final_params.get('trend')
+            if isinstance(tr, str):
+                trend_map = {
+                    "add": ModelMode.ADDITIVE,
+                    "additive": ModelMode.ADDITIVE,
+                    "mul": ModelMode.MULTIPLICATIVE,
+                    "multiplicative": ModelMode.MULTIPLICATIVE,
+                    "none": ModelMode.NONE,
+                    "n": ModelMode.NONE,
+                    "": None
+                }
+                final_params['trend'] = trend_map.get(tr.lower(), None)
 
+            seas = final_params.get('seasonal')
+            if isinstance(seas, str):
+                seasonal_map = {
+                    "add": SeasonalityMode.ADDITIVE,
+                    "additive": SeasonalityMode.ADDITIVE,
+                    "mul": SeasonalityMode.MULTIPLICATIVE,
+                    "multiplicative": SeasonalityMode.MULTIPLICATIVE,
+                    "none": SeasonalityMode.NONE,
+                    "n": SeasonalityMode.NONE,
+                    "": None
+                }
+                final_params['seasonal'] = seasonal_map.get(seas.lower(), None)
 
         # Create a new model instance using the constructor
         model = model_info['constructor'](**final_params)

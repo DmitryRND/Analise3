@@ -17,3 +17,4 @@ pytorch-lightning
 pytorch-forecasting
 catboost
 kaleido
+XGBoost
