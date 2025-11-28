@@ -1,8 +1,11 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 from darts import TimeSeries
+from darts.metrics import mae, mape, r2_score
 import warnings
+import matplotlib.pyplot as plt
 from models_lib import MODELS, train_model
 from utils import (
     plot_decomposition,
@@ -19,31 +22,33 @@ st.set_page_config(
 )
 
 # --- Warnings ---
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# --- Session State ---
+# --- Session State Management ---
 def init_session_state():
-    if "screen" not in st.session_state:
-        st.session_state.screen = "upload"
-    if "df" not in st.session_state:
-        st.session_state.df = None
-    if "settings" not in st.session_state:
-        st.session_state.settings = None
-    if "results" not in st.session_state:
-        st.session_state.results = None
-    if "forecasts" not in st.session_state:
-        st.session_state.forecasts = None
-    if "time_col" not in st.session_state:
-        st.session_state.time_col = None
-    if "value_col" not in st.session_state:
-        st.session_state.value_col = None
-
+    """Initializes session state variables if they don't exist."""
+    defaults = {
+        "screen": "upload",
+        "df": None,
+        "time_col": None,
+        "value_col": None,
+        "extra_cols": [],
+        "n_forecast": 12,
+        "season_period": 12,
+        "ranking_metric": "MAPE",
+        "battle_results": None,
+        "trained_models": None,
+        "forecasts": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 def reset_session():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+    """Resets the session state to start over."""
+    st.session_state.clear()
     init_session_state()
-
 
 # --- Main App Logic ---
 init_session_state()
@@ -64,7 +69,6 @@ if st.session_state.screen == "upload":
             else:
                 df = pd.read_excel(uploaded_file)
 
-            # Proactively convert object columns to datetime
             for col in df.columns:
                 if df[col].dtype == "object":
                     try:
@@ -72,9 +76,9 @@ if st.session_state.screen == "upload":
                     except (ValueError, TypeError):
                         continue
             
-            date_cols_for_dropna = [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
-            if date_cols_for_dropna:
-                df.dropna(subset=date_cols_for_dropna, inplace=True)
+            date_cols = [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
+            if date_cols:
+                df.dropna(subset=date_cols, inplace=True)
 
             st.session_state.df = df
             st.session_state.screen = "setup"
@@ -94,142 +98,198 @@ elif st.session_state.screen == "setup":
     date_cols = [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
     if not date_cols:
         st.error("Не найдено колонок с датами. Пожалуйста, проверьте ваш файл.")
-        if st.button("Начать заново", key="error_reset_1"):
-            reset_session()
-            st.rerun()
+        if st.button("Начать заново"): reset_session(); st.rerun()
         st.stop()
 
-    time_col = st.selectbox("1. Выберите колонку с датой/временем:", date_cols, key="time_col_selector")
+    st.session_state.time_col = st.selectbox("1. Выберите колонку с датой/временем:", date_cols, index=date_cols.index(st.session_state.time_col) if st.session_state.time_col in date_cols else 0)
 
     numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    available_value_cols = [col for col in numeric_cols if col != time_col]
+    available_value_cols = [col for col in numeric_cols if col != st.session_state.time_col]
 
     if not available_value_cols:
         st.error("В файле не найдено числовых колонок для анализа.")
-        if st.button("Начать заново", key="error_reset_2"):
-            reset_session()
-            st.rerun()
+        if st.button("Начать заново"): reset_session(); st.rerun()
         st.stop()
 
-    value_col = st.selectbox("2. Выберите колонку со значениями:", available_value_cols, key="value_col_selector")
+    st.session_state.value_col = st.selectbox("2. Выберите колонку со значениями:", available_value_cols, index=available_value_cols.index(st.session_state.value_col) if st.session_state.value_col in available_value_cols else 0)
     
-    st.session_state.time_col = time_col
-    st.session_state.value_col = value_col
+    available_extra_cols = [col for col in numeric_cols if col not in [st.session_state.time_col, st.session_state.value_col]]
+    st.session_state.extra_cols = st.multiselect("3. Выберите доп. факторы (необязательно):", available_extra_cols, default=st.session_state.extra_cols)
 
-    available_extra_cols = [col for col in numeric_cols if col not in [time_col, value_col]]
-    
     st.subheader("Настройки анализа")
-    col1, col2 = st.columns(2)
+    
+    df_for_series = df.sort_values(by=st.session_state.time_col).copy()
+    df_for_series[st.session_state.value_col] = pd.to_numeric(df_for_series[st.session_state.value_col], errors='coerce')
+    df_for_series.dropna(subset=[st.session_state.value_col], inplace=True)
+    
+    series = TimeSeries.from_dataframe(df_for_series, time_col=st.session_state.time_col, value_cols=st.session_state.value_col, fill_missing_dates=True, freq=None)
+    
+    inferred_freq = pd.infer_freq(series.time_index)
+    if inferred_freq:
+        st.info(f"Определенная частота временного ряда: {inferred_freq}")
+        if 'D' in inferred_freq and st.session_state.get('freq_set_auto', False) is False:
+            st.session_state.season_period = 7
+            st.session_state.freq_set_auto = True
+            st.rerun()
+    else:
+        st.warning("Не удалось автоматически определить частоту ряда.")
 
+    col1, col2 = st.columns(2)
     with col1:
-        extra_cols = st.multiselect("3. Выберите доп. факторы (только числовые):", available_extra_cols, key="extra_cols_selector")
-        test_size = st.slider("4. Размер тестовой выборки (%):", 20, 50, 25, 5)
-        use_optuna = st.toggle("Использовать Optuna?", value=False, help="Может улучшить точность, но значительно дольше.")
+        st.session_state.n_forecast = st.number_input("4. Укажите срок прогнозирования (в шагах):", min_value=1, value=st.session_state.n_forecast, step=1)
+        st.session_state.season_period = st.number_input("5. Укажите период сезонности:", min_value=2, value=st.session_state.season_period, step=1)
+        
+        st.subheader("Метрика для ранжирования")
+        if 0 in series.values():
+            st.session_state.ranking_metric = "MAE"
+            st.info("Рекомендуемая метрика: **MAE**")
+            st.markdown("В ваших данных присутствуют нулевые значения, поэтому **MAPE** (процентная ошибка) не может быть использована. **MAE** (средняя абсолютная ошибка) является лучшей альтернативой.")
+        else:
+            st.session_state.ranking_metric = "MAPE"
+            st.info("Рекомендуемая метрика: **MAPE**")
+            st.markdown("**MAPE** (средняя абсолютная процентная ошибка) отлично подходит для ваших данных, так как показывает ошибку в процентах.")
 
     with col2:
-        ranking_metric = st.selectbox(
-            "5. Метрика для ранжирования:", ["MAPE", "MAE", "R2"], index=0, key="ranking_metric_selector",
-            help="- **MAPE**: Ошибка в %.\n- **MAE**: Ошибка в единицах.\n- **R2**: Качество модели (ближе к 1 - лучше)."
-        )
-        st.success(f"Модели будут отсортированы по **{ranking_metric}**.")
-
-    st.subheader("Анализ временного ряда")
-    try:
-        df_for_series = df.sort_values(by=time_col).copy()
-        series_for_decomp = TimeSeries.from_dataframe(df_for_series, time_col=time_col, value_cols=value_col, fill_missing_dates=True, freq=None)
-        series_for_decomp = series_for_decomp.resample(freq='D').mean()
-        st.pyplot(plot_decomposition(series_for_decomp, value_col))
-    except Exception as e:
-        st.warning(f"Не удалось построить график декомпозиции: {e}")
+        st.subheader("Анализ сезонности")
+        # FIX: Add a strict check to prevent plotting if data is insufficient
+        if len(series) < 2 * st.session_state.season_period:
+            st.warning(f"Недостаточно данных для анализа сезонности. Требуется как минимум {2 * st.session_state.season_period} точек данных (2 периода), а у вас {len(series)}. График не будет построен.")
+        else:
+            try:
+                plt.figure(figsize=(10, 6))
+                plot_decomposition(series, st.session_state.value_col, period=st.session_state.season_period)
+                st.pyplot(plt.gcf())
+                plt.close()
+            except Exception as e:
+                st.warning(f"Не удалось построить график декомпозиции: {e}")
 
     if st.button("🚀 Начать битву моделей!", type="primary"):
         st.session_state.screen = "results"
-        st.session_state.settings = {
-            "test_size": test_size, "extra_cols": extra_cols,
-            "use_optuna": use_optuna, "ranking_metric": ranking_metric,
-        }
         st.rerun()
 
 # --- SCREEN 3: RESULTS ---
 elif st.session_state.screen == "results":
     st.title("Шаг 3: Результаты битвы")
 
-    if st.button("↩️ Начать заново", key="reset_button_results"):
+    if st.button("↩️ Начать заново"):
         reset_session()
         st.rerun()
 
-    df = st.session_state.df
-    settings = st.session_state.settings
-    time_col = st.session_state.time_col
-    value_col = st.session_state.value_col
+    if st.session_state.battle_results is None:
+        df = st.session_state.df
+        time_col = st.session_state.time_col
+        value_col = st.session_state.value_col
+        n_forecast = st.session_state.n_forecast
+        extra_cols = st.session_state.extra_cols
 
-    try:
-        df_sorted = df.sort_values(by=time_col).reset_index(drop=True)
+        try:
+            df_sorted = df.sort_values(by=time_col).reset_index(drop=True)
+            cols_to_process = [value_col] + extra_cols
+            for col in cols_to_process:
+                df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce')
+            df_sorted.dropna(subset=cols_to_process, inplace=True)
 
-        # --- THE FIX: Force numeric conversion and drop bad rows ---
-        cols_to_process = [value_col] + settings["extra_cols"]
-        for col in cols_to_process:
-            df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce')
-        df_sorted.dropna(subset=cols_to_process, inplace=True)
-        # --- END FIX ---
+            series = TimeSeries.from_dataframe(df_sorted, time_col, value_col, fill_missing_dates=True, freq=None).astype(np.float32)
+            
+            # FIX: Add a strict check for minimum training size to prevent IndexError
+            min_train_size = 10 
+            if (len(series) - n_forecast) < min_train_size:
+                st.error(f"Ошибка: Недостаточно данных для обучения. Требуется как минимум {min_train_size} точек данных для обучения, но после выделения горизонта прогноза ({n_forecast}) остается только {len(series) - n_forecast}. Пожалуйста, уменьшите срок прогноза или загрузите больше данных.")
+                st.stop()
 
-        series = TimeSeries.from_dataframe(df_sorted, time_col, value_col, fill_missing_dates=True, freq=None).astype(np.float32)
-        test_size_n = int(len(series) * (settings["test_size"] / 100))
-        train, val = series[:-test_size_n], series[-test_size_n:]
+            train, val = series[:-n_forecast], series[-n_forecast:]
+            
+            future_covariates = None
+            if extra_cols:
+                future_covariates = TimeSeries.from_dataframe(df_sorted, time_col, extra_cols, fill_missing_dates=True, freq=None).astype(np.float32)
 
-        future_covariates = None
-        if settings["extra_cols"]:
-            future_covariates = TimeSeries.from_dataframe(df_sorted, time_col, settings["extra_cols"], fill_missing_dates=True, freq=None).astype(np.float32)
-
-        models_to_run = {name: mi for name, mi in MODELS.items() if not (mi["requires_extras"] and not settings["extra_cols"])}
-        results, forecasts = [], {}
-        
-        progress_bar = st.progress(0, text="Начинаем битву...")
-        for i, (name, model_info) in enumerate(models_to_run.items()):
-            progress_bar.progress((i + 1) / len(models_to_run), text=f"Обучается: {name}")
-            try:
-                _, forecast, metrics = train_model(
-                    model_name=name, model_info=model_info, train_series=train, val_series=val,
-                    use_optuna=settings["use_optuna"], future_covariates=future_covariates,
+            models_to_run = {name: mi for name, mi in MODELS.items() if not (mi["requires_extras"] and not extra_cols)}
+            
+            results_list, forecasts, trained_models = [], {}, {}
+            progress_bar = st.progress(0, text="Начинаем битву...")
+            
+            for i, (name, model_info) in enumerate(models_to_run.items()):
+                progress_bar.progress((i + 1) / len(models_to_run), text=f"Обучается: {name}")
+                
+                forecast, model, error = train_model(
+                    model_name=name, train_series=train,
+                    forecast_horizon=len(val), future_covariates=future_covariates
                 )
-                results.append({"Модель": name, **metrics})
+
+                if error or forecast is None:
+                    results_list.append({"Модель": name, "MAPE": np.nan, "MAE": np.nan, "R2": np.nan, "Гиперпараметры": error or "Неизвестная ошибка"})
+                    continue
+
+                mape_score = mape(val, forecast) if 0 not in val.values() else np.nan
+                mae_score = mae(val, forecast)
+                r2_score_val = r2_score(val, forecast)
+                
+                params = model.model_params if hasattr(model, 'model_params') else model.get_params()
+                
+                results_list.append({"Модель": name, "MAPE": mape_score, "MAE": mae_score, "R2": r2_score_val, "Гиперпараметры": str(params)})
                 forecasts[name] = forecast
-            except Exception as e:
-                results.append({"Модель": name, "MAPE": "Ошибка", "MAE": "Ошибка", "R2": "Ошибка"})
-        progress_bar.empty()
+                trained_models[name] = model
+            
+            progress_bar.empty()
 
-        if not results:
-            st.error("Ни одна модель не смогла быть обучена."); st.stop()
+            if not results_list:
+                st.error("Ни одна модель не смогла быть обучена."); st.stop()
 
-        results_df = pd.DataFrame(results).set_index("Модель")
-        results_df = results_df.sort_values(by=settings["ranking_metric"], ascending=settings["ranking_metric"] != "R2", na_position='last')
+            results_df = pd.DataFrame(results_list).set_index("Модель")
+            results_df = results_df.sort_values(by=st.session_state.ranking_metric, ascending=st.session_state.ranking_metric != "R2", na_position='last')
+            
+            st.session_state.battle_results = results_df
+            st.session_state.forecasts = forecasts
+            st.session_state.trained_models = trained_models
+
+        except Exception as e:
+            st.error(f"Произошла критическая ошибка на этапе выполнения: {e}")
+            st.exception(e)
+            st.stop()
+
+    results_df = st.session_state.battle_results
+    forecasts = st.session_state.forecasts
+    
+    st.subheader(f"🏆 Таблица результатов (прогноз на {st.session_state.n_forecast} шагов)")
+    st.markdown(f"Ранжирование по: **{st.session_state.ranking_metric}**")
+
+    def highlight_best(s):
+        is_min = s.name in ["MAE", "MAPE"]
+        best_val = s.min() if is_min else s.max()
+        return ['background-color: #28a745' if v == best_val else '' for v in s]
+
+    st.dataframe(results_df.style.apply(highlight_best, subset=["MAE", "MAPE", "R2"]).format({"MAPE": "{:.4f}", "MAE": "{:.4f}", "R2": "{:.4f}"}, na_rep="-"))
+
+    st.subheader("📊 График прогнозов")
+    successful_models = list(forecasts.keys())
+    if successful_models:
+        default_models = results_df.dropna(subset=[st.session_state.ranking_metric]).head(3).index.tolist()
         
-        st.session_state.results, st.session_state.forecasts = results_df, forecasts
+        models_to_plot = st.multiselect("Выберите модели для отображения:", successful_models, default=default_models)
         
-        st.subheader("🏆 Таблица результатов")
-        st.dataframe(results_df.style.format("{:.4f}", subset=["MAPE", "MAE", "R2"]))
+        if models_to_plot:
+            series_to_plot = TimeSeries.from_dataframe(st.session_state.df, st.session_state.time_col, st.session_state.value_col, fill_missing_dates=True, freq=None).astype(np.float32)
+            train_plot, val_plot = series_to_plot[:-st.session_state.n_forecast], series_to_plot[-st.session_state.n_forecast:]
+            
+            selected_forecasts = {name: forecasts[name] for name in models_to_plot if name in forecasts}
+            fig = plot_forecast(train_plot, val_plot, selected_forecasts)
+            st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("📊 График прогнозов")
-        models_to_plot = st.multiselect("Выберите модели для отображения:", list(forecasts.keys()), default=list(forecasts.keys()), key="plot_models_selector")
-        selected_forecasts = {name: forecasts[name] for name in models_to_plot if name in forecasts}
-        fig = plot_forecast(train, val, selected_forecasts)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("📥 Выгрузка результатов")
-        best_model_name = results_df.index[0]
-        best_forecast = forecasts[best_model_name]
-        forecast_df = best_forecast.pd_dataframe(); forecast_df.columns = [f"Прогноз ({best_model_name})"]
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.download_button("Скачать CSV", forecast_df.to_csv(index=True).encode("utf-8"), f"forecast_{best_model_name}.csv", "text/csv")
-        with col2:
-            st.download_button("Скачать XLSX", create_excel_download(forecast_df), f"forecast_{best_model_name}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with col3:
-            st.download_button("Скачать PNG", export_fig_to_png(fig), "forecast_plot.png", "image/png")
-
-    except Exception as e:
-        st.error(f"Произошла ошибка: {e}"); st.exception(e)
-        if st.button("Начать заново", key="error_reset_3"):
-            reset_session()
-            st.rerun()
+            st.subheader("📥 Выгрузка результатов")
+            best_model_name = results_df.dropna(subset=[st.session_state.ranking_metric]).index[0]
+            if best_model_name in forecasts:
+                best_forecast = forecasts[best_model_name]
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    # FIX: Correct method call from .pd_dataframe to .pd_dataframe()
+                    st.download_button("Скачать CSV (прогноз)", best_forecast.pd_dataframe().to_csv(index=True).encode("utf-8"), f"forecast_{best_model_name}.csv", "text/csv")
+                with col2:
+                    # FIX: Pass a dataframe to the excel function
+                    st.download_button("Скачать XLSX (прогноз)", create_excel_download(best_forecast.pd_dataframe()), f"forecast_{best_model_name}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                with col3:
+                    st.download_button("Скачать PNG (график)", export_fig_to_png(fig), "forecast_plot.png", "image/png")
+            else:
+                st.warning("Лучшая модель по метрике не смогла быть построена, выгрузка невозможна.")
+    else:
+        st.warning("Ни одна модель не смогла построить прогноз, график недоступен.")

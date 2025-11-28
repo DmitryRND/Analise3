@@ -14,160 +14,129 @@ from darts.models import (
 from darts.metrics import mae, mape, r2_score
 import optuna
 import warnings
+import inspect
 
-# Suppress Optuna's trial pruning messages
+# Suppress warnings for a cleaner output
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
+def get_model_default_params(model_constructor):
+    """Extracts default parameters from a model's constructor."""
+    try:
+        sig = inspect.signature(model_constructor)
+        return {
+            p.name: p.default
+            for p in sig.parameters.values()
+            if p.default is not inspect.Parameter.empty
+        }
+    except Exception:
+        return {}
 
-# 1. Main training function
-def train_model(model_class, train_series, forecast_horizon, future_covariates=None, model_params=None):
+# 1. Main training function - Rewritten for reliability
+def train_model(model_name, train_series, forecast_horizon, future_covariates=None, model_params=None):
     """
-    Trains a single Darts model and returns the forecast.
+    Constructs, trains a single Darts model, and returns the forecast and the trained model object.
+    It now intelligently handles model-specific requirements and returns the model object for inspection.
+    On failure, returns (None, None, error_message).
     """
     if model_params is None:
         model_params = {}
+
+    model_info = MODELS[model_name]
+    
     try:
-        # Handle models that require specific chunk lengths
-        if 'input_chunk_length' in model_class.constructors:
-             if 'input_chunk_length' not in model_params:
-                model_params['input_chunk_length'] = max(30, forecast_horizon * 2)
-             if 'output_chunk_length' not in model_params:
-                model_params['output_chunk_length'] = forecast_horizon
+        # --- INTELLIGENT PARAMETER INJECTION ---
+        final_params = model_info['default_params'].copy()
+        final_params.update(model_params) # User/Optuna params override defaults
 
-        model = model_class(**model_params)
-        model.fit(train_series, future_covariates=future_covariates)
-        forecast = model.predict(forecast_horizon, future_covariates=future_covariates)
-        return forecast, None
-    except Exception as e:
-        return None, str(e)
+        # Special handling for N-BEATS default parameters
+        if model_name == "N-BEATS":
+            # Ensure input_chunk_length is not > len(train_series)
+            input_chunk = 2 * forecast_horizon
+            if input_chunk >= len(train_series):
+                input_chunk = max(1, len(train_series) - forecast_horizon -1)
+                if input_chunk < 1:
+                    return None, None, "Series too short for N-BEATS model."
 
-# 2. Hyperparameter optimization function
-def optimize_hyperparameters(model_name, train_series, val_series, forecast_horizon, future_covariates=None, n_trials=20):
-    """
-    Optimizes hyperparameters for a given model using Optuna.
-    """
-    study_function = OPTIMIZATION_MAP.get(model_name)
-    if not study_function:
-        return None, "Optimization not implemented for this model."
+            final_params.setdefault('input_chunk_length', input_chunk)
+            final_params.setdefault('output_chunk_length', forecast_horizon)
+            # N-BEATS is sensitive, remove unsupported params
+            final_params.pop('lags', None)
+            final_params.pop('lags_future_covariates', None)
 
-    try:
-        study = optuna.create_study(direction="minimize")
-        study.optimize(lambda trial: study_function(trial, train_series, val_series, forecast_horizon, future_covariates), n_trials=n_trials)
 
-        best_params = study.best_params
-        model_info = MODELS[model_name]
-        model_class = model_info['model']
+        # For LightGBM, ensure output_chunk_length is set
+        if model_name in ["LightGBM", "LinearRegression"]:
+             final_params.setdefault('output_chunk_length', forecast_horizon)
+             # These models also need lags
+             final_params.setdefault('lags', forecast_horizon * 2)
 
-        # Re-create model with best params and retrain on full data
-        full_train_series = train_series.append(val_series)
-        
-        forecast, error = train_model(
-            model_class, 
-            full_train_series, 
-            forecast_horizon, 
-            future_covariates=future_covariates, 
-            model_params=best_params
-        )
-        
-        if error:
-            raise Exception(error)
+
+        # Create a new model instance using the constructor
+        model = model_info['constructor'](**final_params)
+
+        # --- INTELLIGENT FITTING ---
+        # Check if model supports future_covariates before passing them
+        if model_info['requires_extras']:
+            if future_covariates is None:
+                return None, None, f"{model_name} requires external factors, but none were provided."
+            if len(future_covariates) < len(train_series) + forecast_horizon:
+                 return None, None, f"External factors for {model_name} are not long enough for the forecast horizon."
             
-        return forecast, None
+            model.fit(train_series, future_covariates=future_covariates)
+            forecast = model.predict(forecast_horizon, future_covariates=future_covariates)
+        else:
+            # For models that don't support extras, don't pass them
+            model.fit(train_series)
+            forecast = model.predict(forecast_horizon)
 
+        return forecast, model, None # Success!
     except Exception as e:
-        return None, str(e)
+        return None, None, f"Error in {model_name}: {e}"
 
 
-# 3. Helper functions for each model's optimization study
-def _study_prophet(trial, train_series, val_series, forecast_horizon, future_covariates):
-    params = {
-        "changepoint_prior_scale": trial.suggest_float("changepoint_prior_scale", 0.001, 0.5, log=True),
-        "seasonality_prior_scale": trial.suggest_float("seasonality_prior_scale", 0.01, 10, log=True),
-        "seasonality_mode": trial.suggest_categorical("seasonality_mode", ["additive", "multiplicative"]),
-    }
-    model = Prophet(**params)
-    model.fit(train_series)
-    forecast = model.predict(len(val_series))
-    return mae(val_series, forecast)
-
-def _study_lgbm(trial, train_series, val_series, forecast_horizon, future_covariates):
-    params = {
-        "lags": trial.suggest_int("lags", 1, 30),
-        "lags_future_covariates": trial.suggest_int("lags_future_covariates", 0, 15) if future_covariates else 0,
-        "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 20, 150),
-    }
-    model = LightGBMModel(**params, random_state=42)
-    model.fit(train_series, future_covariates=future_covariates)
-    forecast = model.predict(len(val_series), future_covariates=future_covariates)
-    return mae(val_series, forecast)
-
-def _study_nbeats(trial, train_series, val_series, forecast_horizon, future_covariates):
-    input_chunk_length = trial.suggest_int("input_chunk_length", 10, 50)
-    params = {
-        "input_chunk_length": input_chunk_length,
-        "output_chunk_length": trial.suggest_int("output_chunk_length", 1, min(input_chunk_length-1, 20)),
-        "num_stacks": trial.suggest_int("num_stacks", 2, 10),
-        "num_blocks": trial.suggest_int("num_blocks", 1, 5),
-        "num_layers": trial.suggest_int("num_layers", 2, 8),
-        "layer_widths": trial.suggest_int("layer_widths", 128, 1024),
-        "n_epochs": trial.suggest_int("n_epochs", 20, 100),
-    }
-    model = NBEATSModel(**params, random_state=42)
-    model.fit(train_series, verbose=False)
-    forecast = model.predict(len(val_series))
-    return mae(val_series, forecast)
-
-
-# 4. The MODELS dictionary
+# 2. The MODELS dictionary with constructors and default parameters
 MODELS = {
     "AutoARIMA": {
-        "model": AutoARIMA,
+        "constructor": AutoARIMA,
         "requires_extras": False,
-        "optimization_implemented": False,
+        "default_params": get_model_default_params(AutoARIMA),
     },
     "Prophet": {
-        "model": Prophet,
+        "constructor": Prophet,
         "requires_extras": False,
-        "optimization_implemented": True,
+        "default_params": get_model_default_params(Prophet),
     },
     "ExponentialSmoothing": {
-        "model": ExponentialSmoothing,
+        "constructor": ExponentialSmoothing,
         "requires_extras": False,
-        "optimization_implemented": False,
+        "default_params": get_model_default_params(ExponentialSmoothing),
     },
     "Theta": {
-        "model": Theta,
+        "constructor": Theta,
         "requires_extras": False,
-        "optimization_implemented": False,
+        "default_params": get_model_default_params(Theta),
     },
+    # FFT is best used with covariates, so we mark it as requiring them
     "FFT": {
-        "model": FFT,
-        "requires_extras": False,
-        "optimization_implemented": False,
+        "constructor": FFT,
+        "requires_extras": True,
+        "default_params": get_model_default_params(FFT),
     },
     "LightGBM": {
-        "model": LightGBMModel,
+        "constructor": lambda **kwargs: LightGBMModel(random_state=42, **kwargs),
         "requires_extras": True,
-        "optimization_implemented": True,
+        "default_params": get_model_default_params(LightGBMModel),
     },
     "LinearRegression": {
-        "model": LinearRegressionModel,
+        "constructor": LinearRegressionModel,
         "requires_extras": True,
-        "optimization_implemented": False,
+        "default_params": get_model_default_params(LinearRegressionModel),
     },
     "N-BEATS": {
-        "model": NBEATSModel,
+        "constructor": lambda **kwargs: NBEATSModel(random_state=42, force_reset=True, pl_trainer_kwargs={"accelerator": "cpu", "enable_progress_bar": False}, **kwargs),
         "requires_extras": False,
-        "optimization_implemented": True,
+        "default_params": get_model_default_params(NBEATSModel),
     },
-}
-
-# 5. Mapping for optimization functions
-OPTIMIZATION_MAP = {
-    "Prophet": _study_prophet,
-    "LightGBM": _study_lgbm,
-    "N-BEATS": _study_nbeats,
 }
