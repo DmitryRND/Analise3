@@ -7,7 +7,8 @@ from scipy import stats
 from io import BytesIO
 from darts import TimeSeries
 import plotly.colors
-
+import plotly.io as pio
+pio.templates.default = "plotly_dark"
 
 def _get_ts_values_and_index(ts: TimeSeries):
     """Вспомогательная функция для получения значений и индекса из TimeSeries."""
@@ -273,14 +274,3 @@ def create_excel_download(ts_or_df):
     output.seek(0)
     return output.getvalue()
 
-def create_png_download(fig):
-    """Конвертирует фигуру Plotly в PNG для скачивания."""
-    output = BytesIO()
-    fig.write_image(output, format="png", scale=2, width=1000, height=600)
-    output.seek(0)
-    return output.getvalue()
-
-
-def export_fig_to_png(fig):
-    """Алиас для create_png_download - экспортирует фигуру Plotly в PNG."""
-    return create_png_download(fig)

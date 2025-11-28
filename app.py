@@ -6,13 +6,14 @@ from darts import TimeSeries
 from darts.metrics import mae, mape, r2_score, rmse
 import warnings
 import plotly.graph_objects as go
+import plotly.io as pio
+pio.templates.default = "plotly_dark"
 from models_lib import MODELS, train_model, optimize_hyperparameters
 from utils import (
     plot_decomposition,
     plot_forecast,
     plot_final_forecast,
     create_excel_download,
-    export_fig_to_png,
     recommend_metric,
 )
 
@@ -641,12 +642,6 @@ elif st.session_state.screen == "results":
                 f"forecast_{best_model_name}.xlsx", 
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        with col3:
-            st.download_button(
-                "Скачать PNG (график)", 
-                export_fig_to_png(fig_final), 
-                "forecast_plot.png", 
-                "image/png"
-            )
+
     else:
         st.warning("Не удалось создать финальный прогноз для выгрузки.")
