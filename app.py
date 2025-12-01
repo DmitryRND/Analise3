@@ -3,10 +3,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from darts import TimeSeries
-from darts.metrics import mae, mape, r2_score, rmse
+from darts.metrics import mae, mape, r2_score, rmse, mse
 import warnings
 import plotly.graph_objects as go
 import plotly.io as pio
+import streamlit.components.v1 as components
 pio.templates.default = "plotly_dark"
 from models_lib import MODELS, train_model, optimize_hyperparameters
 from utils import (
@@ -47,6 +48,8 @@ def init_session_state():
         "forecasts": None,
         "final_forecast": None,
         "manual_date_col": None,
+        "scroll_to_top": False,
+        "val_size": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -59,6 +62,29 @@ def reset_session():
 
 # --- Main App Logic ---
 init_session_state()
+
+# --- Scroll helper ---
+if st.session_state.get("scroll_to_top"):
+    components.html(
+        """
+        <script>
+            (() => {
+                const goTop = () => {
+                    try { window.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                    try { parent.window.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                    try { document.documentElement.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                    try { document.body.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                };
+                requestAnimationFrame(goTop);
+                setTimeout(goTop, 50);
+                setTimeout(goTop, 150);
+            })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+    st.session_state.scroll_to_top = False
 
 # --- SCREEN 1: UPLOAD ---
 if st.session_state.screen == "upload":
@@ -231,12 +257,28 @@ elif st.session_state.screen == "setup":
     st.session_state.n_forecast = st.number_input("4. Укажите срок прогнозирования (в шагах):", min_value=1, value=st.session_state.n_forecast, step=1)
     st.session_state.season_period = st.number_input("5. Укажите период сезонности:", min_value=2, value=st.session_state.season_period, step=1)
     
-    # Рекомендация метрики
+    # Рекомендация метрики + выбор (по умолчанию рекомендуемая)
     st.subheader("Метрика для ранжирования")
     metric_rec = recommend_metric(series)
-    st.session_state.ranking_metric = metric_rec["metric"]
-    st.info(f"Рекомендуемая метрика: **{metric_rec['metric']}**")
+    metric_help = {
+        "MAE": "Средняя абсолютная ошибка, устойчива к выбросам и нулям.",
+        "MAPE": "Средняя процентная ошибка, только для положительных значений, удобна в процентах.",
+        "RMSE": "Корень из среднеквадратичной ошибки, сильнее наказывает крупные промахи.",
+        "MSE": "Среднеквадратичная ошибка, квадрат единиц, жёстко штрафует большие ошибки.",
+        "R2": "Коэффициент детерминации, ближе к 1 — лучше (может быть отрицательным).",
+    }
+    metric_options = list(metric_help.keys())
+    recommended_metric = metric_rec["metric"] if metric_rec["metric"] in metric_options else "MAE"
+    current_metric = st.session_state.ranking_metric if st.session_state.ranking_metric in metric_options else recommended_metric
+    st.session_state.ranking_metric = st.selectbox(
+        "Выберите метрику ранжирования моделей:",
+        metric_options,
+        index=metric_options.index(current_metric),
+        help="Используется для сортировки результатов. По умолчанию — рекомендованная системой.",
+    )
+    st.info(f"Рекомендуемая метрика: **{recommended_metric}**")
     st.markdown(f"**Пояснение:** {metric_rec['reason']}")
+    st.caption("\n".join([f"- **{k}**: {v}" for k, v in metric_help.items()]))
     
     # График декомпозиции
     st.subheader("📈 Анализ сезонности, тренда и выпадов")
@@ -257,11 +299,32 @@ elif st.session_state.screen == "setup":
         st.caption("⚠️ Внимание: подбор гиперпараметров значительно увеличивает время обучения моделей.")
 
     if st.button("🚀 Начать битву моделей!", type="primary"):
+        st.session_state.scroll_to_top = True
         st.session_state.screen = "results"
         st.rerun()
 
 # --- SCREEN 3: RESULTS ---
 elif st.session_state.screen == "results":
+    # Always ensure we scroll to top when entering results
+    components.html(
+        """
+        <script>
+            (() => {
+                const goTop = () => {
+                    try { window.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                    try { parent.window.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                    try { document.documentElement.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                    try { document.body.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) {}
+                };
+                requestAnimationFrame(goTop);
+                setTimeout(goTop, 50);
+                setTimeout(goTop, 150);
+            })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
     st.title("Шаг 3: Результаты битвы")
 
     if st.button("↩️ Начать заново"):
@@ -305,69 +368,110 @@ elif st.session_state.screen == "results":
                         inferred_freq = 'H'
             
             # Создаем TimeSeries с правильной частотой
-            if inferred_freq and len(df_sorted) >= 3:
-                series = TimeSeries.from_dataframe(df_sorted, time_col, value_col, fill_missing_dates=True, freq=inferred_freq).astype(np.float32)
-            elif len(df_sorted) >= 3:
-                series = TimeSeries.from_dataframe(df_sorted, time_col, value_col, fill_missing_dates=False).astype(np.float32)
-            else:
-                st.error(f"Недостаточно данных для анализа. Требуется минимум 3 строки, а у вас {len(df_sorted)}.")
+            try:
+                if len(df_sorted) >= 3:
+                    series = TimeSeries.from_dataframe(
+                        df_sorted, 
+                        time_col=time_col, 
+                        value_cols=value_col,
+                        fill_missing_dates=True,
+                        freq=inferred_freq if inferred_freq else None
+                    ).astype(np.float32)
+                    
+                    # Убедимся, что частота установлена корректно
+                    if not hasattr(series, 'freq') or series.freq is None:
+                        if inferred_freq:
+                            # Пересоздаем ряд с определенной частотой
+                            series = TimeSeries.from_times_and_values(
+                                series.time_index,
+                                series.values(),
+                                freq=inferred_freq,
+                                fill_missing_dates=True
+                            )
+                else:
+                    st.error(f"Недостаточно данных для анализа. Требуется минимум 3 строки, а у вас {len(df_sorted)}.")
+                    st.stop()
+                    
+            except Exception as e:
+                st.error(f"Ошибка при создании временного ряда: {e}")
                 st.stop()
             
             # FIX: Add a strict check for minimum training size to prevent IndexError
-            min_train_size = 10 
-            if (len(series) - n_forecast) < min_train_size:
-                st.error(f"Ошибка: Недостаточно данных для обучения. Требуется как минимум {min_train_size} точек данных для обучения, но после выделения горизонта прогноза ({n_forecast}) остается только {len(series) - n_forecast}. Пожалуйста, уменьшите срок прогноза или загрузите больше данных.")
+            min_train_size = 10
+            max_val_size = len(series) - min_train_size
+            if max_val_size <= 0:
+                st.error(f"Ошибка: Недостаточно данных для обучения. Требуется минимум {min_train_size + 1} точек данных.")
                 st.stop()
 
-            train, val = series[:-n_forecast], series[-n_forecast:]
+            # Валидируем на большем отрезке, чем horizon, если данных хватает
+            suggested_val = max(n_forecast, max(5, int(len(series) * 0.2)))
+            if max_val_size < n_forecast:
+                st.error(f"Ошибка: Недостаточно данных для обучения. После выделения {n_forecast} точек под валидацию остаётся только {len(series) - n_forecast}, требуется минимум {min_train_size}. Уменьшите срок прогноза или загрузите больше данных.")
+                st.stop()
+            val_size = min(suggested_val, max_val_size)
+
+            train, val = series[:-val_size], series[-val_size:]
+            st.session_state.val_size = val_size
             
             future_covariates = None
             if extra_cols:
-                # Очищаем экзогенные переменные от NaN
-                for col in extra_cols:
-                    if df_sorted[col].isna().any():
-                        df_sorted[col].ffill(inplace=True)
-                        df_sorted[col].bfill(inplace=True)
-                    # Если все еще есть NaN, заполняем нулями
-                    df_sorted[col].fillna(0, inplace=True)
+                # Создаем копию датафрейма для экзогенных переменных
+                exog_df = df_sorted[[time_col] + extra_cols].copy()
                 
-                # Создаем экзогенные переменные с той же частотой
+                # Обрабатываем каждую экзогенную переменную
+                for col in extra_cols:
+                    # Удаляем нечисловые символы и преобразуем в числа
+                    if exog_df[col].dtype == 'object':
+                        exog_df[col] = exog_df[col].astype(str).str.replace(',', '.', regex=False)
+                        exog_df[col] = exog_df[col].str.replace(r'[^\d.-]', '', regex=True)
+                    
+                    # Преобразуем в числовой формат
+                    exog_df[col] = pd.to_numeric(exog_df[col], errors='coerce')
+                    
+                    # Заполняем пропущенные значения
+                    exog_df[col].ffill(inplace=True)
+                    exog_df[col].bfill(inplace=True)
+                    exog_df[col].fillna(0, inplace=True)  # Оставшиеся NaN заполняем нулями
+                
                 try:
-                    # Убеждаемся, что экзогенные переменные имеют ту же частоту и временной индекс
-                    if inferred_freq:
-                        # Используем тот же временной диапазон и частоту, что и основной ряд
-                        # Важно: используем fill_missing_dates=True с freq для корректной работы
-                        # Сначала создаем без заполнения, чтобы проверить частоту
-                        try:
-                            future_covariates = TimeSeries.from_dataframe(
-                                df_sorted, 
-                                time_col, 
-                                extra_cols, 
-                                fill_missing_dates=True, 
-                                freq=inferred_freq
-                            ).astype(np.float32)
-                        except ValueError as e:
-                            # Если freq не работает, пробуем без явного freq
-                            future_covariates = TimeSeries.from_dataframe(
-                                df_sorted, 
-                                time_col, 
-                                extra_cols, 
-                                fill_missing_dates=True,
-                                freq=None
-                            ).astype(np.float32)
-                            # Устанавливаем freq вручную если возможно
-                            try:
-                                future_covariates = future_covariates.with_freq(inferred_freq) if inferred_freq else future_covariates
-                            except:
-                                pass
+                    # Создаем TimeSeries для экзогенных переменных
+                    future_covariates = TimeSeries.from_dataframe(
+                        exog_df,
+                        time_col=time_col,
+                        fill_missing_dates=True,
+                        freq=inferred_freq if inferred_freq else None
+                    ).astype(np.float32)
+                    
+                    # Проверяем, что временные индексы совпадают
+                    if not series.time_index.equals(future_covariates.time_index):
+                        # Если индексы не совпадают, выравниваем их
+                        common_time_index = series.time_index.intersection(future_covariates.time_index)
+                        if len(common_time_index) == 0:
+                            raise ValueError("Временные индексы основного ряда и экзогенных переменных не совпадают.")
                         
-                        # Дополняем экзогенные переменные для периода прогноза (используем последние значения)
-                        if len(future_covariates) < len(series) + n_forecast:
-                            from utils import _get_ts_values_and_index
-                            last_values, last_index = _get_ts_values_and_index(future_covariates)
-                            last_vals = last_values[-1] if len(last_values.shape) == 1 else last_values[-1, :]
-                            
-                            # Создаем дополнительные даты на основе частоты
+                        # Обрезаем оба ряда до общего временного диапазона
+                        series = series.slice_intersect(future_covariates)
+                        future_covariates = future_covariates.slice_intersect(series)
+                    
+                    # Проверяем размерности
+                    if future_covariates.n_components != len(extra_cols):
+                        raise ValueError(f"Ошибка размерности: ожидалось {len(extra_cols)} экзогенных переменных, получено {future_covariates.n_components}")
+                    
+                except Exception as e:
+                    st.error(f"Ошибка при создании экзогенных переменных: {e}")
+                    st.warning("Модели будут обучены без учета экзогенных переменных.")
+                    future_covariates = None
+                    extra_cols = []
+                
+                # Дополняем экзогенные переменные для периода прогноза (используем последние значения)
+                if future_covariates is not None and len(future_covariates) < len(series) + n_forecast:
+                    try:
+                        from utils import _get_ts_values_and_index
+                        last_values, last_index = _get_ts_values_and_index(future_covariates)
+                        last_vals = last_values[-1] if len(last_values.shape) == 1 else last_values[-1, :]
+                        
+                        # Создаем дополнительные даты на основе частоты
+                        if inferred_freq:
                             last_date = last_index[-1]
                             if inferred_freq == 'D':
                                 freq_timedelta = pd.Timedelta(days=1)
@@ -389,11 +493,14 @@ elif st.session_state.screen == "results":
                             
                             extended_ts = TimeSeries.from_times_and_values(extended_dates, extended_values)
                             future_covariates = future_covariates.concatenate(extended_ts)
-                    else:
-                        # Без частоты просто создаем без заполнения пропусков
-                        future_covariates = TimeSeries.from_dataframe(df_sorted, time_col, extra_cols, fill_missing_dates=False).astype(np.float32)
-                except Exception as e:
-                    st.warning(f"Не удалось создать экзогенные переменные: {e}. Модели будут работать без них.")
+                        
+                    except Exception as e:
+                        st.warning(f"Не удалось дополнить экзогенные переменные для прогноза: {e}")
+                        future_covariates = None
+                
+                # Если не удалось создать future_covariates, сбрасываем экзогенные переменные
+                if future_covariates is None:
+                    extra_cols = []
                     future_covariates = None
 
             # Выбор моделей согласно требованиям
@@ -403,6 +510,9 @@ elif st.session_state.screen == "results":
             # Добавляем CatBoost, если он доступен
             if "CatBoost" in MODELS:
                 base_models.append("CatBoost")
+            # Добавляем ETNA Linear, если доступен
+            if "ETNA_Linear" in MODELS:
+                base_models.append("ETNA_Linear")
             advanced_models = ["FFT", "N-BEATS"]
             
             if extra_cols:
@@ -441,7 +551,8 @@ elif st.session_state.screen == "results":
                         forecast_horizon=len(val),
                         future_covariates=future_covariates,
                         n_trials=st.session_state.n_trials,
-                        metric=st.session_state.ranking_metric.lower()
+                        metric=st.session_state.ranking_metric.lower(),
+                        season_length=st.session_state.season_period,
                     )
                     if opt_error:
                         st.warning(f"Не удалось оптимизировать {name}: {opt_error}. Используются параметры по умолчанию.")
@@ -459,11 +570,12 @@ elif st.session_state.screen == "results":
                     train_series=train,
                     forecast_horizon=len(val), 
                     future_covariates=future_covariates,
-                    model_params=best_params if best_params else None
+                    model_params=best_params if best_params else None,
+                    season_length=st.session_state.season_period,
                 )
 
                 if error or forecast is None:
-                    results_list.append({"Модель": name, "MAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Гиперпараметры": error or "Неизвестная ошибка"})
+                    results_list.append({"Модель": name, "MAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "MSE": np.nan, "R2": np.nan, "Гиперпараметры": error or "Неизвестная ошибка"})
                     continue
 
                 # Получаем значения для проверки нулей
@@ -473,6 +585,7 @@ elif st.session_state.screen == "results":
                 mae_score = mae(val, forecast)
                 r2_score_val = r2_score(val, forecast)
                 rmse_score = rmse(val, forecast)
+                mse_score = mse(val, forecast)
                 
                 # Сохраняем информацию о гиперпараметрах
                 if best_params:
@@ -484,7 +597,7 @@ elif st.session_state.screen == "results":
                     except:
                         params_str = "По умолчанию"
                 
-                results_list.append({"Модель": name, "MAPE": mape_score, "MAE": mae_score, "RMSE": rmse_score, "R2": r2_score_val, "Гиперпараметры": params_str})
+                results_list.append({"Модель": name, "MAPE": mape_score, "MAE": mae_score, "RMSE": rmse_score, "MSE": mse_score, "R2": r2_score_val, "Гиперпараметры": params_str})
                 forecasts[name] = forecast
                 trained_models[name] = model
             
@@ -524,7 +637,8 @@ elif st.session_state.screen == "results":
                         train_series=series,
                         forecast_horizon=n_forecast,
                         future_covariates=future_covariates,
-                        model_params=model_params if model_params else None
+                        model_params=model_params if model_params else None,
+                        season_length=st.session_state.season_period,
                     )
                     if not error and forecast_result is not None:
                         final_forecast = forecast_result
@@ -548,11 +662,19 @@ elif st.session_state.screen == "results":
     st.markdown(f"Ранжирование по: **{st.session_state.ranking_metric}**")
 
     def highlight_best(s):
-        is_min = s.name in ["MAE", "MAPE", "RMSE"]
+        is_min = s.name in ["MAE", "MAPE", "RMSE", "MSE"]
         best_val = s.min() if is_min else s.max()
         return ['background-color: #28a745' if v == best_val else '' for v in s]
 
-    st.dataframe(results_df.style.apply(highlight_best, subset=["MAE", "MAPE", "RMSE", "R2"]).format({"MAPE": "{:.4f}", "MAE": "{:.4f}", "RMSE": "{:.4f}", "R2": "{:.4f}"}, na_rep="-"))
+    st.dataframe(
+        results_df.style.apply(
+            highlight_best,
+            subset=["MAE", "MAPE", "RMSE", "MSE", "R2"]
+        ).format(
+            {"MAPE": "{:.4f}", "MAE": "{:.4f}", "RMSE": "{:.4f}", "MSE": "{:.4f}", "R2": "{:.4f}"},
+            na_rep="-"
+        )
+    )
 
     # График прогнозов на тестовых данных
     st.subheader("📊 График прогнозов моделей на тестовых данных")
@@ -581,11 +703,62 @@ elif st.session_state.screen == "results":
                     elif pd.Timedelta(hours=11) <= median_diff <= pd.Timedelta(hours=13):
                         plot_freq = 'H'
             
-            if plot_freq:
-                series_to_plot = TimeSeries.from_dataframe(df_for_plot, st.session_state.time_col, st.session_state.value_col, fill_missing_dates=True, freq=plot_freq).astype(np.float32)
-            else:
-                series_to_plot = TimeSeries.from_dataframe(df_for_plot, st.session_state.time_col, st.session_state.value_col, fill_missing_dates=False).astype(np.float32)
-            train_plot, val_plot = series_to_plot[:-st.session_state.n_forecast], series_to_plot[-st.session_state.n_forecast:]
+            # Ensure the time column is in datetime format
+            time_col = st.session_state.time_col
+            value_col = st.session_state.value_col
+            
+            # Make a copy to avoid modifying the original
+            plot_df = df_for_plot[[time_col, value_col]].copy()
+            
+            # Convert to datetime if not already
+            if not pd.api.types.is_datetime64_any_dtype(plot_df[time_col]):
+                plot_df[time_col] = pd.to_datetime(plot_df[time_col], errors='coerce')
+            
+            # Set the time column as index
+            plot_df = plot_df.set_index(time_col).sort_index()
+            
+            # Try to infer frequency if not provided
+            if not plot_freq:
+                try:
+                    plot_freq = pd.infer_freq(plot_df.index)
+                    if not plot_freq:  # If frequency couldn't be inferred
+                        # Calculate median time difference
+                        time_diffs = plot_df.index.to_series().diff().dropna()
+                        if not time_diffs.empty:
+                            median_diff = time_diffs.median()
+                            if pd.Timedelta(days=27) <= median_diff <= pd.Timedelta(days=33):
+                                plot_freq = 'M'  # Monthly
+                            elif median_diff >= pd.Timedelta(days=80) and median_diff <= pd.Timedelta(days=100):
+                                plot_freq = 'Q'  # Quarterly
+                            elif median_diff >= pd.Timedelta(days=300) and median_diff <= pd.Timedelta(days=400):
+                                plot_freq = 'A'  # Yearly
+                            elif median_diff <= pd.Timedelta(hours=2):
+                                plot_freq = 'H'  # Hourly
+                            else:
+                                plot_freq = 'D'  # Daily as fallback
+                except Exception:
+                    plot_freq = None
+            
+            # Create TimeSeries with inferred frequency
+            try:
+                series_to_plot = TimeSeries.from_dataframe(
+                    plot_df.reset_index(), 
+                    time_col=time_col, 
+                    value_cols=value_col,
+                    fill_missing_dates=True,
+                    freq=plot_freq
+                ).astype(np.float32)
+            except Exception as e:
+                # Fallback without frequency if there's an error
+                st.warning(f"Could not set frequency for plotting: {e}. Plotting without frequency.")
+                series_to_plot = TimeSeries.from_dataframe(
+                    plot_df.reset_index(), 
+                    time_col=time_col, 
+                    value_cols=value_col,
+                    fill_missing_dates=False
+                ).astype(np.float32)
+            val_size_plot = st.session_state.get("val_size", st.session_state.n_forecast)
+            train_plot, val_plot = series_to_plot[:-val_size_plot], series_to_plot[-val_size_plot:]
             
             selected_forecasts = {name: forecasts[name] for name in models_to_plot if name in forecasts}
             fig_test = plot_forecast(train_plot, val_plot, selected_forecasts)
@@ -597,27 +770,64 @@ elif st.session_state.screen == "results":
     st.subheader("🎯 Финальный прогноз на нужный период (лучшая модель)")
     best_model_name = results_df.dropna(subset=[st.session_state.ranking_metric]).index[0]
     if st.session_state.final_forecast is not None:
-        df_for_final = st.session_state.df.sort_values(by=st.session_state.time_col).copy()
-        df_for_final[st.session_state.value_col] = pd.to_numeric(df_for_final[st.session_state.value_col], errors='coerce')
-        df_for_final.dropna(subset=[st.session_state.value_col], inplace=True)
-        # Используем ту же логику определения частоты
-        df_final_indexed = df_for_final.set_index(st.session_state.time_col).sort_index()
-        final_freq = pd.infer_freq(df_final_indexed.index)
-        if final_freq is None and len(df_final_indexed) > 1:
-            time_diffs = df_final_indexed.index.to_series().diff().dropna()
-            if len(time_diffs) > 0:
-                median_diff = time_diffs.median()
-                if pd.Timedelta(hours=23) <= median_diff <= pd.Timedelta(hours=25):
-                    final_freq = 'D'
-                elif pd.Timedelta(days=27) <= median_diff <= pd.Timedelta(days=32):
-                    final_freq = 'M'
-                elif pd.Timedelta(hours=11) <= median_diff <= pd.Timedelta(hours=13):
-                    final_freq = 'H'
+        time_col = st.session_state.time_col
+        value_col = st.session_state.value_col
         
-        if final_freq:
-            series_full = TimeSeries.from_dataframe(df_for_final, st.session_state.time_col, st.session_state.value_col, fill_missing_dates=True, freq=final_freq).astype(np.float32)
-        else:
-            series_full = TimeSeries.from_dataframe(df_for_final, st.session_state.time_col, st.session_state.value_col, fill_missing_dates=False).astype(np.float32)
+        # Prepare the final data
+        df_for_final = st.session_state.df.sort_values(by=time_col).copy()
+        df_for_final[value_col] = pd.to_numeric(df_for_final[value_col], errors='coerce')
+        df_for_final.dropna(subset=[value_col], inplace=True)
+        
+        # Make a copy to avoid modifying the original
+        plot_df = df_for_final[[time_col, value_col]].copy()
+        
+        # Convert to datetime if not already
+        if not pd.api.types.is_datetime64_any_dtype(plot_df[time_col]):
+            plot_df[time_col] = pd.to_datetime(plot_df[time_col], errors='coerce')
+        
+        # Remove any rows with NaT in the time column
+        plot_df = plot_df.dropna(subset=[time_col])
+        
+        # Set the time column as index and sort
+        plot_df = plot_df.set_index(time_col).sort_index()
+        
+        # Try to infer frequency
+        final_freq = pd.infer_freq(plot_df.index)
+        
+        if not final_freq and len(plot_df) > 1:
+            # Calculate median time difference
+            time_diffs = plot_df.index.to_series().diff().dropna()
+            if not time_diffs.empty:
+                median_diff = time_diffs.median()
+                if pd.Timedelta(days=23) <= median_diff <= pd.Timedelta(days=33):
+                    final_freq = 'M'  # Monthly
+                elif pd.Timedelta(hours=11) <= median_diff <= pd.Timedelta(hours=13):
+                    final_freq = 'H'  # Hourly
+                elif pd.Timedelta(hours=23) <= median_diff <= pd.Timedelta(hours=25):
+                    final_freq = 'D'  # Daily
+                elif pd.Timedelta(days=80) <= median_diff <= pd.Timedelta(days=100):
+                    final_freq = 'Q'  # Quarterly
+                elif pd.Timedelta(days=300) <= median_diff <= pd.Timedelta(days=400):
+                    final_freq = 'A'  # Yearly
+        
+        # Create TimeSeries with inferred frequency
+        try:
+            series_full = TimeSeries.from_dataframe(
+                plot_df.reset_index(),
+                time_col=time_col,
+                value_cols=value_col,
+                fill_missing_dates=True,
+                freq=final_freq if final_freq else None
+            ).astype(np.float32)
+        except Exception as e:
+            # Fallback without frequency if there's an error
+            st.warning(f"Could not set frequency for final forecast plot: {e}. Plotting without frequency.")
+            series_full = TimeSeries.from_dataframe(
+                plot_df.reset_index(),
+                time_col=time_col,
+                value_cols=value_col,
+                fill_missing_dates=False
+            ).astype(np.float32)
         
         fig_final = plot_final_forecast(series_full, st.session_state.final_forecast)
         st.plotly_chart(fig_final, width='stretch')

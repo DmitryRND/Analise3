@@ -18,3 +18,4 @@ pytorch-forecasting
 catboost
 kaleido
 XGBoost
+etna

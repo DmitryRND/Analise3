@@ -223,18 +223,21 @@ def plot_decomposition(ts: TimeSeries, value_col: str = None, period: int = 12):
 def plot_backtest(history: TimeSeries, validation: TimeSeries, forecasts: dict):
     """Строит график сравнения прогнозов моделей на тестовых данных."""
     fig = go.Figure()
-    colors = plotly.colors.qualitative.Plotly
+    palette = [
+        "#4dabf7", "#f59f00", "#20c997", "#e64980", "#ffa94d",
+        "#94d82d", "#748ffc", "#ff922b", "#63e6be", "#ced4da",
+    ]
     
     # Получаем данные из TimeSeries
     hist_values, hist_index = _get_ts_values_and_index(history)
     val_values, val_index = _get_ts_values_and_index(validation)
     
-    fig.add_trace(go.Scatter(x=hist_index, y=hist_values, name="История", line=dict(color='black', width=2)))
-    fig.add_trace(go.Scatter(x=val_index, y=val_values, name="Тестовые данные", line=dict(color='#FF4136', dash='dash')))
+    fig.add_trace(go.Scatter(x=hist_index, y=hist_values, name="История", line=dict(color='#E6E8EF', width=2)))
+    fig.add_trace(go.Scatter(x=val_index, y=val_values, name="Тестовые данные", line=dict(color='#FF6B6B', dash='dash')))
 
     for i, (model_name, forecast_ts) in enumerate(forecasts.items()):
         if forecast_ts is not None:
-            color = colors[i % len(colors)]
+            color = palette[i % len(palette)]
             forecast_values, forecast_index = _get_ts_values_and_index(forecast_ts)
             fig.add_trace(go.Scatter(x=forecast_index, y=forecast_values, name=model_name, line=dict(color=color, width=2)))
 
@@ -255,8 +258,8 @@ def plot_final_forecast(history: TimeSeries, forecast: TimeSeries):
     hist_values, hist_index = _get_ts_values_and_index(history)
     forecast_values, forecast_index = _get_ts_values_and_index(forecast)
     
-    fig.add_trace(go.Scatter(x=hist_index, y=hist_values, name="Вся история", line=dict(color='black', width=2)))
-    fig.add_trace(go.Scatter(x=forecast_index, y=forecast_values, name="Финальный прогноз", line=dict(color='#0074D9', width=3)))
+    fig.add_trace(go.Scatter(x=hist_index, y=hist_values, name="Вся история", line=dict(color='#E6E8EF', width=2)))
+    fig.add_trace(go.Scatter(x=forecast_index, y=forecast_values, name="Финальный прогноз", line=dict(color='#4dabf7', width=3)))
     fig.update_layout(hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), yaxis_title="Значение")
     return fig
 
@@ -273,4 +276,3 @@ def create_excel_download(ts_or_df):
             df.to_excel(writer, sheet_name='Data', index=True)
     output.seek(0)
     return output.getvalue()
-

@@ -22,6 +22,17 @@ import optuna
 import warnings
 import inspect
 import numpy as np
+import pandas as pd
+
+# Optional ETNA
+try:
+    from etna.datasets import TSDataset
+    from etna.models import LinearPerSegmentModel
+    from etna.pipeline import Pipeline as EtnaPipeline
+    from etna.transforms import LagTransform
+    ETNA_AVAILABLE = True
+except ImportError:
+    ETNA_AVAILABLE = False
 
 # Suppress warnings for a cleaner output
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -42,7 +53,7 @@ def get_model_default_params(model_constructor):
 
 
 def optimize_hyperparameters(model_name, train_series, val_series, forecast_horizon, 
-                             future_covariates=None, n_trials=10, metric='mae'):
+                             future_covariates=None, n_trials=10, metric='mae', season_length=None):
     """
     Оптимизирует гиперпараметры модели с помощью Optuna.
     Возвращает лучшие параметры или None при ошибке.
@@ -50,6 +61,10 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
     model_info = MODELS.get(model_name)
     if not model_info:
         return None, f"Модель {model_name} не найдена"
+
+    # Для AutoARIMA гипероптимизацию не запускаем: она сама перебирает сетку
+    if model_name == "AutoARIMA":
+        return None, "Оптимизация AutoARIMA отключена: модель сама подбирает порядки."
     
     # Определяем метрику для оптимизации
     if metric.lower() == 'mae':
@@ -123,8 +138,14 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
                 params['n_epochs'] = trial.suggest_int('n_epochs', 10, 50)
             
             # Обучаем модель с этими параметрами
-            forecast, _, error = train_model(model_name, train_series, forecast_horizon, 
-                                            future_covariates=future_covariates, model_params=params)
+            forecast, _, error = train_model(
+                model_name,
+                train_series,
+                forecast_horizon,
+                future_covariates=future_covariates,
+                model_params=params,
+                season_length=season_length,
+            )
             
             if error or forecast is None:
                 return float('inf') if direction == 'minimize' else float('-inf')
@@ -155,7 +176,7 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
         return None, f"Ошибка оптимизации: {e}"
 
 # 1. Main training function - Rewritten for reliability
-def train_model(model_name, train_series, forecast_horizon, future_covariates=None, model_params=None):
+def train_model(model_name, train_series, forecast_horizon, future_covariates=None, model_params=None, season_length=None):
     """
     Constructs, trains a single Darts model, and returns the forecast and the trained model object.
     It now intelligently handles model-specific requirements and returns the model object for inspection.
@@ -187,17 +208,48 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             final_params.pop('lags_future_covariates', None)
 
 
+        # Inject seasonality into models that support it (attempt, fallback-safe, only if param exists)
+        if model_name == "AutoARIMA":
+            if season_length and season_length > 1:
+                final_params["m"] = season_length
+                final_params["seasonal"] = True
+            else:
+                final_params["seasonal"] = False
+        if model_name == "ExponentialSmoothing" and season_length:
+            final_params.setdefault('seasonal_periods', season_length)
+        if model_name == "Theta" and season_length:
+            # Darts Theta uses seasonality_period
+            final_params.setdefault('seasonality_period', season_length)
+
         # For LightGBM and LinearRegression, ensure output_chunk_length is set
         if model_name in ["LightGBM", "LinearRegression", "CatBoost"]:
-             final_params.setdefault('output_chunk_length', forecast_horizon)
-             # These models also need lags (but can work without future_covariates)
-             if 'lags' not in final_params or final_params['lags'] is None:
-                 final_params['lags'] = min(forecast_horizon * 2, len(train_series) - forecast_horizon)
-             # Если используются future_covariates, нужно установить lags_future_covariates (должен быть tuple или list)
-             if future_covariates is not None:
-                 if 'lags_future_covariates' not in final_params or final_params['lags_future_covariates'] is None:
-                     lag_val = min(forecast_horizon, len(train_series) - forecast_horizon)
-                     final_params['lags_future_covariates'] = tuple(range(1, lag_val + 1)) if lag_val > 0 else (1,)
+            final_params.setdefault('output_chunk_length', forecast_horizon)
+            
+            # Set lags for the target variable
+            if 'lags' not in final_params or final_params['lags'] is None:
+                # Use a reasonable default for lags based on the forecast horizon
+                lags = min(forecast_horizon * 2, len(train_series) - forecast_horizon - 1)
+                final_params['lags'] = lags if lags > 0 else 1
+            
+            # Handle future covariates if they exist
+            if future_covariates is not None:
+                # Ensure lags_future_covariates is properly set
+                if 'lags_future_covariates' not in final_params or final_params['lags_future_covariates'] is None:
+                    # Use the same lags as the target variable by default
+                    lag_val = final_params.get('lags', forecast_horizon)
+                    # Ensure we don't exceed the available data
+                    max_lag = min(lag_val, len(train_series) - forecast_horizon - 1)
+                    if max_lag > 0:
+                        final_params['lags_future_covariates'] = list(range(1, max_lag + 1))
+                    else:
+                        # If we can't have any lags, use a minimal lag of 1
+                        final_params['lags_future_covariates'] = [1]
+                
+                # Ensure lags_future_covariates is a list or tuple
+                if isinstance(final_params['lags_future_covariates'], int):
+                    final_params['lags_future_covariates'] = [final_params['lags_future_covariates']]
+                elif not isinstance(final_params['lags_future_covariates'], (list, tuple)):
+                    final_params['lags_future_covariates'] = [1]  # Default to lag 1 if invalid
         
         # Для LightGBM и CatBoost добавляем параметры, чтобы убрать предупреждения и ускорить работу
         if model_name == "LightGBM":
@@ -278,7 +330,37 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
                 final_params['seasonal'] = seasonal_map.get(seas.lower(), None)
     
         # Create a new model instance using the constructor
-        model = model_info['constructor'](**final_params)
+        if model_name == "AutoARIMA" and season_length and season_length > 1:
+            final_params.pop("min_d", None)  # может не поддерживаться
+            seasonal_variants = [
+                {"m": season_length, "seasonal": True},
+            ]
+        else:
+            seasonal_variants = [{}]
+
+        model = None
+        last_error = None
+        for variant in seasonal_variants:
+            params_variant = final_params.copy()
+            params_variant.update(variant)
+            try:
+                model = model_info['constructor'](**params_variant)
+                break
+            except TypeError as e:
+                last_error = e
+                continue
+
+        if model is None:
+            # Final fallback without seasonal keys
+            cleanup_keys = ["m", "season_length", "seasonal_periods", "seasonal"]
+            cleaned_params = {k: v for k, v in final_params.items() if k not in cleanup_keys}
+            try:
+                model = model_info['constructor'](**cleaned_params)
+            except Exception:
+                if last_error:
+                    raise last_error
+                else:
+                    raise
 
         # --- INTELLIGENT FITTING ---
         # FFT не поддерживает future_covariates вообще
@@ -305,6 +387,30 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             
             model.fit(train_series, future_covariates=future_covariates)
             forecast = model.predict(forecast_horizon, future_covariates=future_covariates)
+        elif model_name == "ETNA_Linear":
+            if not ETNA_AVAILABLE:
+                return None, None, "ETNA недоступна (не установлен пакет etna)."
+            if len(train_series) < 4:
+                return None, None, "ETNA Linear требует минимум 4 точки для построения лагов."
+            try:
+                values, idx = train_series.values().flatten(), train_series.time_index
+                df = pd.DataFrame({"timestamp": idx, "target": values, "segment": "segment_0"})
+                freq = pd.infer_freq(df["timestamp"]) or "D"
+                tsd = TSDataset(df, freq=freq)
+                max_lag = min(7, max(1, len(train_series) - 1))
+                lags = list(range(1, max_lag + 1))
+                pipeline = EtnaPipeline(
+                    model=LinearPerSegmentModel(),
+                    transforms=[LagTransform(in_column="target", lags=lags)],
+                )
+                pipeline.fit(tsd)
+                forecast_tsd = pipeline.forecast(forecast_horizon)
+                fc_df = forecast_tsd.to_pandas(flatten=True).reset_index()
+                fc_df = fc_df.rename(columns={"timestamp": "time", "target": "value"})
+                forecast = TimeSeries.from_dataframe(fc_df, time_col="time", value_cols="value", fill_missing_dates=False)
+                model = pipeline
+            except Exception as e:
+                return None, None, f"Error in {model_name}: {e}"
         else:
             # For models that don't support extras, don't pass them
             model.fit(train_series)
@@ -367,4 +473,12 @@ if CATBOOST_AVAILABLE:
         "constructor": lambda **kwargs: CatBoostModel(random_state=42, verbose=False, **kwargs),
         "requires_extras": False,  # Может работать без экзогенных переменных
         "default_params": get_model_default_params(CatBoostModel),
+    }
+
+# Добавляем ETNA, если доступна
+if ETNA_AVAILABLE:
+    MODELS["ETNA_Linear"] = {
+        "constructor": lambda **kwargs: LinearPerSegmentModel(**kwargs),
+        "requires_extras": False,
+        "default_params": {},
     }
