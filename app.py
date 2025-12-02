@@ -579,13 +579,37 @@ elif st.session_state.screen == "results":
                     continue
 
                 # Получаем значения для проверки нулей
+                # Считаем метрики, выравнивая ряды по минимальной длине и убирая NaN
                 from utils import _get_ts_values_and_index
                 val_values, _ = _get_ts_values_and_index(val)
-                mape_score = mape(val, forecast) if 0 not in val_values else np.nan
-                mae_score = mae(val, forecast)
-                r2_score_val = r2_score(val, forecast)
-                rmse_score = rmse(val, forecast)
-                mse_score = mse(val, forecast)
+                fc_values, _ = _get_ts_values_and_index(forecast)
+                min_len = min(len(val_values), len(fc_values))
+                if min_len == 0:
+                    mape_score = mae_score = r2_score_val = rmse_score = mse_score = np.nan
+                else:
+                    v_arr = val_values[:min_len].astype(float)
+                    f_arr = fc_values[:min_len].astype(float)
+                    mask = np.isfinite(v_arr) & np.isfinite(f_arr)
+                    v_arr = v_arr[mask]
+                    f_arr = f_arr[mask]
+                    if len(v_arr) == 0:
+                        mape_score = mae_score = r2_score_val = rmse_score = mse_score = np.nan
+                    else:
+                        # простые numpy-метрики
+                        mae_score = float(np.mean(np.abs(v_arr - f_arr)))
+                        mse_score = float(np.mean((v_arr - f_arr) ** 2))
+                        rmse_score = float(np.sqrt(mse_score))
+                        if 0 in v_arr:
+                            mape_score = np.nan
+                        else:
+                            mape_score = float(np.mean(np.abs((v_arr - f_arr) / v_arr)) * 100)
+                        var = np.var(v_arr)
+                        if var == 0:
+                            r2_score_val = np.nan
+                        else:
+                            ss_res = np.sum((v_arr - f_arr) ** 2)
+                            ss_tot = np.sum((v_arr - np.mean(v_arr)) ** 2)
+                            r2_score_val = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
                 
                 # Сохраняем информацию о гиперпараметрах
                 if best_params:
@@ -610,6 +634,17 @@ elif st.session_state.screen == "results":
                 st.error("Ни одна модель не смогла быть обучена."); st.stop()
 
             results_df = pd.DataFrame(results_list).set_index("Модель")
+            # Если выбранная метрика вся NaN, пробуем подобрать другую, но не останавливаем выполнение
+            metric_priority = ["MAE", "RMSE", "MAPE", "MSE", "R2"]
+            non_nan_metrics = [m for m in metric_priority if m in results_df.columns and results_df[m].notna().any()]
+            if not non_nan_metrics:
+                st.warning("Ни одна модель не рассчитала метрики (все значения NaN). Показаны результаты как есть. Ниже подробности по моделям.")
+                st.dataframe(results_df.reset_index())  # выводим сырые результаты с ошибками
+                st.session_state.ranking_metric = metric_priority[0]
+            elif not results_df[st.session_state.ranking_metric].notna().any():
+                fallback_metric = non_nan_metrics[0]
+                st.warning(f"Метрика {st.session_state.ranking_metric} недоступна (все NaN). Используется {fallback_metric}.")
+                st.session_state.ranking_metric = fallback_metric
             # Определяем, в каком порядке сортировать:
             # для R2 и RMSE по убыванию (больше лучше), для остальных по возрастанию.
             ascending_flag = False if st.session_state.ranking_metric == "R2" else True
@@ -622,7 +657,11 @@ elif st.session_state.screen == "results":
             )
             
             # Создаем финальный прогноз лучшей модели на весь период
-            best_model_name = results_df.dropna(subset=[st.session_state.ranking_metric]).index[0]
+            non_na_results = results_df.dropna(subset=[st.session_state.ranking_metric])
+            if non_na_results.empty:
+                st.error("Ни одна модель не рассчитала выбранную метрику (все значения NaN). Попробуйте другую метрику или другой горизонт.")
+                st.stop()
+            best_model_name = non_na_results.index[0]
             best_model = trained_models.get(best_model_name)
             final_forecast = None
             
@@ -768,8 +807,12 @@ elif st.session_state.screen == "results":
     
     # График финального прогноза лучшей модели
     st.subheader("🎯 Финальный прогноз на нужный период (лучшая модель)")
-    best_model_name = results_df.dropna(subset=[st.session_state.ranking_metric]).index[0]
-    if st.session_state.final_forecast is not None:
+    non_na_results = results_df.dropna(subset=[st.session_state.ranking_metric])
+    if non_na_results.empty:
+        st.warning("Финальный прогноз недоступен: нет моделей с рассчитанной выбранной метрикой.")
+    else:
+        best_model_name = non_na_results.index[0]
+    if st.session_state.final_forecast is not None and non_na_results is not None and not non_na_results.empty:
         time_col = st.session_state.time_col
         value_col = st.session_state.value_col
         

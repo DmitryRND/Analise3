@@ -16,6 +16,5 @@ statsforecast
 pytorch-lightning
 pytorch-forecasting
 catboost
-kaleido
 XGBoost
 etna

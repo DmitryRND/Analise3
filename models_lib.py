@@ -182,6 +182,34 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
     It now intelligently handles model-specific requirements and returns the model object for inspection.
     On failure, returns (None, None, error_message).
     """
+    def _ts_to_df(ts: TimeSeries):
+        """Универсальное преобразование TimeSeries в DataFrame без пропусков."""
+        try:
+            if hasattr(ts, "pd_dataframe"):
+                df = ts.pd_dataframe()
+            elif hasattr(ts, "to_dataframe"):
+                df = ts.to_dataframe()
+            else:
+                values = ts.values().flatten()
+                df = pd.DataFrame({"value": values}, index=ts.time_index)
+            df = df.dropna()
+            return df
+        except Exception:
+            return None
+
+    def _dropna_ts(ts: TimeSeries):
+        df = _ts_to_df(ts)
+        if df is None or df.empty:
+            return ts
+        df_reset = df.reset_index().rename(columns={df.index.name or "index": "time"})
+        return TimeSeries.from_dataframe(
+            df_reset,
+            time_col="time",
+            value_cols=[c for c in df_reset.columns if c != "time"],
+            fill_missing_dates=False,
+            freq=getattr(ts, "freq", None),
+        )
+
     if model_params is None:
         model_params = {}
 
@@ -363,6 +391,21 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
                     raise
 
         # --- INTELLIGENT FITTING ---
+        # Drop NaNs that can break sklearn-based models
+        try:
+            ts_df = _ts_to_df(train_series)
+            if ts_df is not None and ts_df.isna().values.any():
+                train_series = _dropna_ts(train_series)
+        except Exception:
+            pass
+        if future_covariates is not None:
+            try:
+                fc_df = _ts_to_df(future_covariates)
+                if fc_df is not None and fc_df.isna().values.any():
+                    future_covariates = _dropna_ts(future_covariates)
+            except Exception:
+                pass
+
         # FFT не поддерживает future_covariates вообще
         if model_name == "FFT":
             # FFT работает без экзогенных переменных в darts
@@ -395,16 +438,30 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             try:
                 values, idx = train_series.values().flatten(), train_series.time_index
                 df = pd.DataFrame({"timestamp": idx, "target": values, "segment": "segment_0"})
-                freq = pd.infer_freq(df["timestamp"]) or "D"
-                tsd = TSDataset(df, freq=freq)
+                freq = pd.infer_freq(df["timestamp"])
+                if freq is None:
+                    freq = "D"
+                # Строим непрерывный диапазон дат и заполняем пропуски вперёд/назад
+                full_range = pd.date_range(start=df["timestamp"].min(), end=df["timestamp"].max(), freq=freq)
+                df_full = (
+                    df.set_index("timestamp")
+                    .reindex(full_range)
+                    .ffill()
+                    .bfill()
+                    .reset_index()
+                    .rename(columns={"index": "timestamp"})
+                )
+                df_full["segment"] = "segment_0"
+                tsd = TSDataset(df_full, freq=freq)
                 max_lag = min(7, max(1, len(train_series) - 1))
                 lags = list(range(1, max_lag + 1))
                 pipeline = EtnaPipeline(
                     model=LinearPerSegmentModel(),
                     transforms=[LagTransform(in_column="target", lags=lags)],
+                    horizon=forecast_horizon,
                 )
                 pipeline.fit(tsd)
-                forecast_tsd = pipeline.forecast(forecast_horizon)
+                forecast_tsd = pipeline.forecast()  # horizon задан в pipeline
                 fc_df = forecast_tsd.to_pandas(flatten=True).reset_index()
                 fc_df = fc_df.rename(columns={"timestamp": "time", "target": "value"})
                 forecast = TimeSeries.from_dataframe(fc_df, time_col="time", value_cols="value", fill_missing_dates=False)

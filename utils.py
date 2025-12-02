@@ -18,14 +18,15 @@ def _get_ts_values_and_index(ts: TimeSeries):
             values = ts.values().flatten()
         elif hasattr(ts, 'data_array'):
             values = ts.data_array().values.flatten()
+        elif hasattr(ts, 'pd_dataframe'):
+            df = ts.pd_dataframe()
+            values = df.iloc[:, 0].values
+        elif hasattr(ts, 'to_dataframe'):
+            df = ts.to_dataframe()
+            values = df.iloc[:, 0].values
         else:
-            # Альтернативный способ - через pd_dataframe если доступен
-            try:
-                df = ts.pd_dataframe()
-                values = df.iloc[:, 0].values
-            except AttributeError:
-                # Последний вариант - через values_at_times
-                values = np.array([ts.values_at_times(ts.time_index[i])[0] for i in range(len(ts))])
+            # Последний вариант - через values_at_times
+            values = np.array([ts.values_at_times(ts.time_index[i])[0] for i in range(len(ts))])
         
         return values, ts.time_index
     except Exception as e:
@@ -40,6 +41,13 @@ def _get_ts_values_and_index(ts: TimeSeries):
 
 def _get_ts_dataframe(ts: TimeSeries):
     """Вспомогательная функция для конвертации TimeSeries в pandas DataFrame."""
+    try:
+        if hasattr(ts, "pd_dataframe"):
+            return ts.pd_dataframe()
+        if hasattr(ts, "to_dataframe"):
+            return ts.to_dataframe()
+    except Exception:
+        pass
     values, index = _get_ts_values_and_index(ts)
     return pd.DataFrame({'value': values}, index=index)
 
