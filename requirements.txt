@@ -17,4 +17,3 @@ pytorch-lightning
 pytorch-forecasting
 catboost
 XGBoost
-etna

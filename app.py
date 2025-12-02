@@ -510,9 +510,6 @@ elif st.session_state.screen == "results":
             # Добавляем CatBoost, если он доступен
             if "CatBoost" in MODELS:
                 base_models.append("CatBoost")
-            # Добавляем ETNA Linear, если доступен
-            if "ETNA_Linear" in MODELS:
-                base_models.append("ETNA_Linear")
             advanced_models = ["FFT", "N-BEATS"]
             
             if extra_cols:

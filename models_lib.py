@@ -24,16 +24,6 @@ import inspect
 import numpy as np
 import pandas as pd
 
-# Optional ETNA
-try:
-    from etna.datasets import TSDataset
-    from etna.models import LinearPerSegmentModel
-    from etna.pipeline import Pipeline as EtnaPipeline
-    from etna.transforms import LagTransform
-    ETNA_AVAILABLE = True
-except ImportError:
-    ETNA_AVAILABLE = False
-
 # Suppress warnings for a cleaner output
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -210,12 +200,35 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             freq=getattr(ts, "freq", None),
         )
 
+    def _nan_stats(ts: TimeSeries, label: str):
+        df = _ts_to_df(ts)
+        if df is None:
+            print(f"[DEBUG] {label}: df is None")
+            return
+        na_count = df.isna().sum().sum()
+        print(f"[DEBUG] {label}: len={len(df)}, na_count={na_count}")
+
     if model_params is None:
         model_params = {}
 
     model_info = MODELS[model_name]
     
     try:
+        # Жёстко убираем пропуски в target и ковариатах перед обучением
+        _nan_stats(train_series, f"{model_name} train before dropna")
+        if hasattr(train_series, "drop_missing_values"):
+            train_series = train_series.drop_missing_values()
+        else:
+            train_series = _dropna_ts(train_series)
+        _nan_stats(train_series, f"{model_name} train after dropna")
+        if future_covariates is not None:
+            _nan_stats(future_covariates, f"{model_name} cov before dropna")
+            if hasattr(future_covariates, "drop_missing_values"):
+                future_covariates = future_covariates.drop_missing_values()
+            else:
+                future_covariates = _dropna_ts(future_covariates)
+            _nan_stats(future_covariates, f"{model_name} cov after dropna")
+
         # --- INTELLIGENT PARAMETER INJECTION ---
         final_params = model_info['default_params'].copy()
         final_params.update(model_params) # User/Optuna params override defaults
@@ -430,44 +443,6 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             
             model.fit(train_series, future_covariates=future_covariates)
             forecast = model.predict(forecast_horizon, future_covariates=future_covariates)
-        elif model_name == "ETNA_Linear":
-            if not ETNA_AVAILABLE:
-                return None, None, "ETNA недоступна (не установлен пакет etna)."
-            if len(train_series) < 4:
-                return None, None, "ETNA Linear требует минимум 4 точки для построения лагов."
-            try:
-                values, idx = train_series.values().flatten(), train_series.time_index
-                df = pd.DataFrame({"timestamp": idx, "target": values, "segment": "segment_0"})
-                freq = pd.infer_freq(df["timestamp"])
-                if freq is None:
-                    freq = "D"
-                # Строим непрерывный диапазон дат и заполняем пропуски вперёд/назад
-                full_range = pd.date_range(start=df["timestamp"].min(), end=df["timestamp"].max(), freq=freq)
-                df_full = (
-                    df.set_index("timestamp")
-                    .reindex(full_range)
-                    .ffill()
-                    .bfill()
-                    .reset_index()
-                    .rename(columns={"index": "timestamp"})
-                )
-                df_full["segment"] = "segment_0"
-                tsd = TSDataset(df_full, freq=freq)
-                max_lag = min(7, max(1, len(train_series) - 1))
-                lags = list(range(1, max_lag + 1))
-                pipeline = EtnaPipeline(
-                    model=LinearPerSegmentModel(),
-                    transforms=[LagTransform(in_column="target", lags=lags)],
-                    horizon=forecast_horizon,
-                )
-                pipeline.fit(tsd)
-                forecast_tsd = pipeline.forecast()  # horizon задан в pipeline
-                fc_df = forecast_tsd.to_pandas(flatten=True).reset_index()
-                fc_df = fc_df.rename(columns={"timestamp": "time", "target": "value"})
-                forecast = TimeSeries.from_dataframe(fc_df, time_col="time", value_cols="value", fill_missing_dates=False)
-                model = pipeline
-            except Exception as e:
-                return None, None, f"Error in {model_name}: {e}"
         else:
             # For models that don't support extras, don't pass them
             model.fit(train_series)
@@ -530,12 +505,4 @@ if CATBOOST_AVAILABLE:
         "constructor": lambda **kwargs: CatBoostModel(random_state=42, verbose=False, **kwargs),
         "requires_extras": False,  # Может работать без экзогенных переменных
         "default_params": get_model_default_params(CatBoostModel),
-    }
-
-# Добавляем ETNA, если доступна
-if ETNA_AVAILABLE:
-    MODELS["ETNA_Linear"] = {
-        "constructor": lambda **kwargs: LinearPerSegmentModel(**kwargs),
-        "requires_extras": False,
-        "default_params": {},
     }
