@@ -8,6 +8,13 @@ import warnings
 import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit.components.v1 as components
+import time
+import os
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 pio.templates.default = "plotly_dark"
 from models_lib import MODELS, train_model, optimize_hyperparameters
 from utils import (
@@ -30,6 +37,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- Helpers ---
+MAX_ROWS = 5000
+
+# Ограничиваем число потоков для матричных библиотек на слабых серверах
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 def adjust_daily_to_monthly(freq, index):
     """
     Возвращаем исходную частоту без принудительных преобразований.
@@ -75,6 +89,23 @@ def safe_timeseries_from_df(df, time_col, value_col, freq, label=""):
                 value_cols=value_col,
                 fill_missing_dates=False,
             )
+
+def render_resource_panel(start_time=None):
+    """Показываем быструю информацию о ресурсах в сайдбаре."""
+    with st.sidebar:
+        st.markdown("### Мониторинг")
+        if psutil:
+            proc = psutil.Process()
+            cpu = psutil.cpu_percent(interval=0.1)
+            mem = proc.memory_info().rss / (1024 ** 2)
+            sys_mem = psutil.virtual_memory()
+            st.write(f"CPU: {cpu:.1f}%")
+            st.write(f"RAM: {mem:.1f} MB / {(sys_mem.total/(1024**3)):.1f} GB")
+        else:
+            st.write("psutil не установлен")
+        if start_time:
+            elapsed = time.time() - start_time
+            st.write(f"Время с запуска: {elapsed/60:.1f} мин")
 
 # --- Session State Management ---
 def init_session_state():
@@ -150,6 +181,12 @@ if st.session_state.screen == "upload":
                 df = pd.read_csv(uploaded_file)
             else:
                 df = pd.read_excel(uploaded_file)
+
+            # Ограничение по строкам для слабых серверов
+            if len(df) > MAX_ROWS:
+                st.warning(f"Файл содержит {len(df)} строк, лимит — {MAX_ROWS}. На слабом сервере это может упасть.")
+                if not st.button("Продолжить несмотря на лимит", key="continue_over_limit"):
+                    st.stop()
 
             # Попытка автоматически найти столбцы с датами
             # Используем более гибкий парсинг дат
@@ -483,6 +520,8 @@ elif st.session_state.screen == "setup":
 
 # --- SCREEN 3: RESULTS ---
 elif st.session_state.screen == "results":
+    # Мониторинг ресурсов
+    render_resource_panel(st.session_state.get("run_start_time"))
     # Always ensure we scroll to top when entering results
     components.html(
         """
@@ -515,6 +554,12 @@ elif st.session_state.screen == "results":
         value_col = st.session_state.value_col
         n_forecast = st.session_state.n_forecast
         extra_cols = st.session_state.extra_cols
+        st.session_state.run_start_time = time.time()
+        # Ограничение гипероптимизации для слабых серверов
+        if st.session_state.use_hyperopt and len(df) > 1500:
+            st.warning("Гипероптимизация отключена из-за большого объема данных. Включите вручную только при необходимости.")
+            st.session_state.use_hyperopt = False
+            st.session_state.n_trials = min(st.session_state.n_trials, 10)
 
         try:
             df_sorted = df.sort_values(by=time_col).reset_index(drop=True)
