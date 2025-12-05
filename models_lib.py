@@ -10,6 +10,8 @@ from darts.models import (
     LightGBMModel,
     LinearRegressionModel,
     NBEATSModel,
+    NHiTSModel,
+    TCNModel,
 )
 # Пробуем импортировать CatBoostModel, если доступен
 try:
@@ -52,10 +54,6 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
     if not model_info:
         return None, f"Модель {model_name} не найдена"
 
-    # Для AutoARIMA гипероптимизацию не запускаем: она сама перебирает сетку
-    if model_name == "AutoARIMA":
-        return None, "Оптимизация AutoARIMA отключена: модель сама подбирает порядки."
-    
     # Определяем метрику для оптимизации
     if metric.lower() == 'mae':
         metric_func = mae
@@ -70,9 +68,6 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
     elif metric.lower() == 'rmse':
         metric_func = rmse
         direction = 'minimize'
-    elif metric.lower() == 'r2':
-        metric_func = r2_score
-        direction = 'maximize'
     else:
         metric_func = mae
         direction = 'minimize'
@@ -82,7 +77,29 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
             # Определяем пространство гиперпараметров в зависимости от модели
             params = {}
             
-            if model_name == "Prophet":
+            if model_name == "AutoARIMA":
+                params['start_p'] = trial.suggest_int('start_p', 0, 2)
+                params['start_q'] = trial.suggest_int('start_q', 0, 2)
+                params['max_p'] = trial.suggest_int('max_p', 3, 8)
+                params['max_q'] = trial.suggest_int('max_q', 3, 8)
+                params['d'] = trial.suggest_int('d', 0, 2)
+                params['max_d'] = trial.suggest_int('max_d', 1, 2)
+                params['max_order'] = trial.suggest_int('max_order', 5, 12)
+                params['stepwise'] = trial.suggest_categorical('stepwise', [True, False])
+                params['stationary'] = trial.suggest_categorical('stationary', [True, False])
+                if season_length and season_length > 1:
+                    params['start_P'] = trial.suggest_int('start_P', 0, 1)
+                    params['start_Q'] = trial.suggest_int('start_Q', 0, 1)
+                    params['max_P'] = trial.suggest_int('max_P', 1, 4)
+                    params['max_Q'] = trial.suggest_int('max_Q', 1, 4)
+                    params['D'] = trial.suggest_int('D', 0, 1)
+                    params['max_D'] = trial.suggest_int('max_D', 1, 2)
+                    params['m'] = season_length
+                    params['seasonal'] = True
+                else:
+                    params['seasonal'] = False
+
+            elif model_name == "Prophet":
                 params['yearly_seasonality'] = trial.suggest_categorical('yearly_seasonality', [True, False])
                 params['weekly_seasonality'] = trial.suggest_categorical('weekly_seasonality', [True, False])
                 params['daily_seasonality'] = trial.suggest_categorical('daily_seasonality', [True, False])
@@ -126,6 +143,7 @@ def optimize_hyperparameters(model_name, train_series, val_series, forecast_hori
                 params['input_chunk_length'] = input_chunk
                 params['output_chunk_length'] = forecast_horizon
                 params['n_epochs'] = trial.suggest_int('n_epochs', 10, 50)
+
             
             # Обучаем модель с этими параметрами
             forecast, _, error = train_model(
@@ -200,34 +218,30 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
             freq=getattr(ts, "freq", None),
         )
 
-    def _nan_stats(ts: TimeSeries, label: str):
-        df = _ts_to_df(ts)
-        if df is None:
-            print(f"[DEBUG] {label}: df is None")
-            return
-        na_count = df.isna().sum().sum()
-        print(f"[DEBUG] {label}: len={len(df)}, na_count={na_count}")
-
     if model_params is None:
         model_params = {}
 
     model_info = MODELS[model_name]
     
+    # Если целевая константная, некоторые модели (CatBoost) падают — пропускаем их
+    if model_name == "CatBoost":
+        df_target = _ts_to_df(train_series)
+        if df_target is not None and not df_target.empty:
+            y_vals = df_target.iloc[:, 0].to_numpy()
+            if np.nanmax(y_vals) - np.nanmin(y_vals) == 0:
+                return None, None, "CatBoost skipped: target is constant."
+
     try:
         # Жёстко убираем пропуски в target и ковариатах перед обучением
-        _nan_stats(train_series, f"{model_name} train before dropna")
         if hasattr(train_series, "drop_missing_values"):
             train_series = train_series.drop_missing_values()
         else:
             train_series = _dropna_ts(train_series)
-        _nan_stats(train_series, f"{model_name} train after dropna")
         if future_covariates is not None:
-            _nan_stats(future_covariates, f"{model_name} cov before dropna")
             if hasattr(future_covariates, "drop_missing_values"):
                 future_covariates = future_covariates.drop_missing_values()
             else:
                 future_covariates = _dropna_ts(future_covariates)
-            _nan_stats(future_covariates, f"{model_name} cov after dropna")
 
         # --- INTELLIGENT PARAMETER INJECTION ---
         final_params = model_info['default_params'].copy()
@@ -258,6 +272,24 @@ def train_model(model_name, train_series, forecast_horizon, future_covariates=No
                 final_params["seasonal"] = False
         if model_name == "ExponentialSmoothing" and season_length:
             final_params.setdefault('seasonal_periods', season_length)
+        if model_name == "N-HiTS":
+            # Гибкая длина окна: минимум 2, максимум весь ряд минус 1
+            max_input = max(2, len(train_series) - 1)
+            input_chunk = max(2, min(max_input, forecast_horizon * 2))
+            final_params.setdefault('input_chunk_length', input_chunk)
+            final_params.setdefault('output_chunk_length', forecast_horizon)
+            final_params.setdefault('random_state', 42)
+        if model_name == "TCN":
+            max_input = max(2, len(train_series) - 1)
+            input_chunk = max(2, min(max_input, forecast_horizon * 2))
+            final_params.setdefault('input_chunk_length', input_chunk)
+            final_params.setdefault('output_chunk_length', forecast_horizon)
+            final_params.setdefault('kernel_size', 3)
+            final_params.setdefault('num_filters', 5)
+            final_params.setdefault('dilation_base', 2)
+            final_params.setdefault('dropout', 0.1)
+            final_params.setdefault('weight_norm', True)
+            final_params.setdefault('random_state', 42)
         if model_name == "Theta" and season_length:
             # Darts Theta uses seasonality_period
             final_params.setdefault('seasonality_period', season_length)
@@ -496,6 +528,20 @@ MODELS = {
         "constructor": lambda **kwargs: NBEATSModel(random_state=42, force_reset=True, pl_trainer_kwargs={"accelerator": "cpu", "enable_progress_bar": False}, **kwargs),
         "requires_extras": False,
         "default_params": get_model_default_params(NBEATSModel),
+    },
+    "N-HiTS": {
+        "constructor": lambda **kwargs: NHiTSModel(
+            force_reset=True,
+            pl_trainer_kwargs={"accelerator": "cpu", "enable_progress_bar": False},
+            **kwargs,
+        ),
+        "requires_extras": False,
+        "default_params": get_model_default_params(NHiTSModel),
+    },
+    "TCN": {
+        "constructor": lambda **kwargs: TCNModel(**kwargs),
+        "requires_extras": False,
+        "default_params": get_model_default_params(TCNModel),
     },
 }
 

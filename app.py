@@ -29,6 +29,53 @@ st.set_page_config(
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# --- Helpers ---
+def adjust_daily_to_monthly(freq, index):
+    """
+    Возвращаем исходную частоту без принудительных преобразований.
+    """
+    return freq, False  # None или найденная частота без подмены
+
+def normalize_month_start(df, time_col, freq):
+    """
+    Без преобразований — вернём как есть.
+    """
+    return df
+
+def safe_timeseries_from_df(df, time_col, value_col, freq, label=""):
+    """
+    Создаёт TimeSeries с попыткой заполнить пропуски по freq, при ошибках пробует freq=None,
+    и в финале строит без fill_missing_dates.
+    """
+    try:
+        return TimeSeries.from_dataframe(
+            df,
+            time_col=time_col,
+            value_cols=value_col,
+            fill_missing_dates=True,
+            freq=freq,
+        )
+    except Exception as e1:
+        if label:
+            st.warning(f"Не удалось установить частоту ({freq}) для {label}: {e1}. Пробую без freq.")
+        try:
+            return TimeSeries.from_dataframe(
+                df,
+                time_col=time_col,
+                value_cols=value_col,
+                fill_missing_dates=True,
+                freq=None,
+            )
+        except Exception as e2:
+            if label:
+                st.warning(f"Не удалось заполнить даты для {label} даже без freq: {e2}. Строю без fill_missing_dates.")
+            return TimeSeries.from_dataframe(
+                df,
+                time_col=time_col,
+                value_cols=value_col,
+                fill_missing_dates=False,
+            )
+
 # --- Session State Management ---
 def init_session_state():
     """Initializes session state variables if they don't exist."""
@@ -41,6 +88,7 @@ def init_session_state():
         "n_forecast": 12,
         "season_period": 12,
         "ranking_metric": "MAPE",
+        "ranking_metric_user_set": False,
         "use_hyperopt": False,
         "n_trials": 10,
         "battle_results": None,
@@ -90,6 +138,7 @@ if st.session_state.get("scroll_to_top"):
 if st.session_state.screen == "upload":
     st.title("⚔️ Битва моделей временных рядов")
     st.header("Шаг 1: Загрузите ваш файл")
+    st.info("Перед загрузкой убедитесь, что временной ряд предобработан: даты приведены к нужной частоте, пропуски заполнены, дубликаты удалены.")
 
     uploaded_file = st.file_uploader(
         "Выберите CSV или Excel файл", type=["csv", "xlsx"]
@@ -114,6 +163,31 @@ if st.session_state.screen == "upload":
                             df[col] = parsed
                     except (ValueError, TypeError):
                         continue
+                # Пробуем интерпретировать колонку года (формат YYYY)
+                if str(col).lower() in ["year", "год"] or pd.api.types.is_integer_dtype(df[col]):
+                    parsed_year = pd.to_datetime(df[col], format="%Y", errors="coerce")
+                    if parsed_year.notna().sum() > len(df) * 0.8:
+                        df[col] = parsed_year
+
+            # Проверяем пропуски и предлагаем заполнить на этапе загрузки
+            total_missing = int(df.isna().sum().sum())
+            if total_missing > 0:
+                miss_cols = df.isna().sum()
+                miss_cols = miss_cols[miss_cols > 0].to_dict()
+                st.warning(f"В файле обнаружены пропуски ({total_missing} значений). Колонки с пропусками: {miss_cols}")
+                if st.button("Заполнить пропуски автоматически", key="fill_missing_upload"):
+                    df_filled = df.copy()
+                    num_cols = df_filled.select_dtypes(include=[np.number]).columns
+                    for col in num_cols:
+                        if df_filled[col].isna().any():
+                            df_filled[col] = df_filled[col].interpolate(limit_direction="both")
+                            df_filled[col] = df_filled[col].fillna(df_filled[col].mean(skipna=True))
+                    # Остальные колонки заполняем предыдущими/следующими значениями
+                    other_cols = [c for c in df_filled.columns if c not in num_cols]
+                    if other_cols:
+                        df_filled[other_cols] = df_filled[other_cols].ffill().bfill()
+                    df = df_filled
+                    st.success("Пропуски заполнены автоматически.")
             
             date_cols = [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
             if date_cols:
@@ -130,6 +204,9 @@ if st.session_state.screen == "upload":
 elif st.session_state.screen == "setup":
     st.title("Шаг 2: Анализ и настройка")
     df = st.session_state.df
+
+    if len(df) > 500:
+        st.warning("⚠️ Файл содержит более 500 строк. Обучение и расчёты могут занять заметно больше времени.")
 
     st.subheader("Предпросмотр данных")
     st.dataframe(df.head(5))
@@ -200,6 +277,17 @@ elif st.session_state.screen == "setup":
     st.subheader("Настройки анализа")
     
     df_for_series = df.sort_values(by=st.session_state.time_col).copy()
+    # Если выбрана колонка года — переводим в даты (начало года)
+    if not pd.api.types.is_datetime64_any_dtype(df_for_series[st.session_state.time_col]):
+        if str(st.session_state.time_col).lower() in ["year", "год"]:
+            df_for_series[st.session_state.time_col] = pd.to_datetime(df_for_series[st.session_state.time_col], format="%Y", errors="coerce")
+    
+    # Удаляем дубликаты по времени
+    dup_count = df_for_series.duplicated(subset=[st.session_state.time_col]).sum()
+    if dup_count > 0:
+        st.warning(f"Обнаружены дубликаты по времени ({dup_count}). Они будут удалены.")
+        df_for_series = df_for_series.drop_duplicates(subset=[st.session_state.time_col], keep="first")
+
     # Очищаем числовые данные от запятых и других разделителей
     if df_for_series[st.session_state.value_col].dtype == 'object':
         df_for_series[st.session_state.value_col] = df_for_series[st.session_state.value_col].astype(str).str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
@@ -214,6 +302,7 @@ elif st.session_state.screen == "setup":
     # Пробуем определить частоту автоматически
     df_indexed = df_for_series.set_index(st.session_state.time_col).sort_index()
     inferred_freq = pd.infer_freq(df_indexed.index)
+    inferred_freq, monthly_forced = adjust_daily_to_monthly(inferred_freq, df_indexed.index)
     
     # Если частота не определена, пробуем определить по разнице между датами
     if inferred_freq is None and len(df_indexed) > 1:
@@ -230,12 +319,18 @@ elif st.session_state.screen == "setup":
             else:
                 inferred_freq = None
     
+            if not monthly_forced:
+                inferred_freq, monthly_forced = adjust_daily_to_monthly(inferred_freq, df_indexed.index)
+    
     # Создаем TimeSeries с определенной частотой или без заполнения пропусков
-    if inferred_freq:
-        series = TimeSeries.from_dataframe(df_for_series, time_col=st.session_state.time_col, value_cols=st.session_state.value_col, fill_missing_dates=True, freq=inferred_freq)
-    else:
-        # Если частоту определить не удалось, создаем без заполнения пропусков
-        series = TimeSeries.from_dataframe(df_for_series, time_col=st.session_state.time_col, value_cols=st.session_state.value_col, fill_missing_dates=False)
+    df_for_series = normalize_month_start(df_for_series, st.session_state.time_col, inferred_freq)
+    series = safe_timeseries_from_df(
+        df_for_series,
+        time_col=st.session_state.time_col,
+        value_col=st.session_state.value_col,
+        freq=inferred_freq,
+        label="основного ряда",
+    )
     
     # Показываем информацию о частоте
     series_freq = pd.infer_freq(series.time_index)
@@ -256,6 +351,71 @@ elif st.session_state.screen == "setup":
 
     st.session_state.n_forecast = st.number_input("4. Укажите срок прогнозирования (в шагах):", min_value=1, value=st.session_state.n_forecast, step=1)
     st.session_state.season_period = st.number_input("5. Укажите период сезонности:", min_value=2, value=st.session_state.season_period, step=1)
+
+    # Проверка и заполнение пропусков в выбранных колонках
+    cols_to_check = [st.session_state.value_col] + st.session_state.extra_cols
+    missing_counts = {col: df_for_series[col].isna().sum() for col in cols_to_check}
+    total_missing = sum(missing_counts.values())
+    if total_missing > 0:
+        st.warning(f"Обнаружены пропуски в данных: {missing_counts}")
+
+        def has_trend(series_vals):
+            vals = series_vals.dropna().to_numpy()
+            if len(vals) < 3:
+                return False
+            x = np.arange(len(vals))
+            slope = np.polyfit(x, vals, 1)[0]
+            std = np.std(vals) + 1e-8
+            return abs(slope) / std > 0.05
+
+        trend_present = has_trend(df_for_series[st.session_state.value_col])
+        suggested_method = "интерполяцией" if trend_present else "средним"
+        st.info(f"Предлагаем заполнить пропуски {suggested_method} (тренд {'обнаружен' if trend_present else 'не обнаружен'}).")
+
+        if st.button("Заполнить пропуски автоматически"):
+            for col in cols_to_check:
+                if df_for_series[col].isna().any():
+                    if trend_present:
+                        df_for_series[col] = df_for_series[col].interpolate(limit_direction="both")
+                    else:
+                        mean_val = df_for_series[col].mean(skipna=True)
+                        df_for_series[col] = df_for_series[col].fillna(mean_val)
+            st.success("Пропуски заполнены.")
+    # Страховка: если остались NaN, заполняем последним значением, затем средним
+    if df_for_series[cols_to_check].isna().any().any():
+        df_for_series[cols_to_check] = df_for_series[cols_to_check].ffill().bfill()
+        for col in cols_to_check:
+            if df_for_series[col].isna().any():
+                df_for_series[col] = df_for_series[col].fillna(df_for_series[col].mean(skipna=True))
+
+    # Проверка пропусков по временной шкале и кнопка для заполнения дат
+    freq_guess = pd.infer_freq(df_for_series.sort_values(by=st.session_state.time_col)[st.session_state.time_col])
+    if not freq_guess:
+        diffs = df_for_series[st.session_state.time_col].sort_values().diff().dropna()
+        if not diffs.empty:
+            median_diff = diffs.median()
+            if pd.Timedelta(days=27) <= median_diff <= pd.Timedelta(days=32):
+                freq_guess = "M"
+            elif pd.Timedelta(days=360) <= median_diff <= pd.Timedelta(days=380):
+                freq_guess = "A"
+    if freq_guess:
+        full_index = pd.date_range(
+            start=df_for_series[st.session_state.time_col].min(),
+            end=df_for_series[st.session_state.time_col].max(),
+            freq=freq_guess,
+        )
+        missing_dates = full_index.difference(df_for_series[st.session_state.time_col])
+        if len(missing_dates) > 0:
+            st.warning(f"Обнаружены пропущенные даты: {len(missing_dates)} точек. Частота: {freq_guess}")
+            if st.button("Заполнить пропущенные даты", key="fill_missing_dates"):
+                df_tmp = df_for_series.set_index(st.session_state.time_col).reindex(full_index)
+                # интерполяция числовых колонок
+                for col in cols_to_check:
+                    df_tmp[col] = df_tmp[col].interpolate(limit_direction="both")
+                    df_tmp[col] = df_tmp[col].fillna(df_tmp[col].mean(skipna=True))
+                df_tmp = df_tmp.ffill().bfill()
+                df_for_series = df_tmp.reset_index().rename(columns={"index": st.session_state.time_col})
+                st.success("Пропущенные даты заполнены.")
     
     # Рекомендация метрики + выбор (по умолчанию рекомендуемая)
     st.subheader("Метрика для ранжирования")
@@ -265,17 +425,30 @@ elif st.session_state.screen == "setup":
         "MAPE": "Средняя процентная ошибка, только для положительных значений, удобна в процентах.",
         "RMSE": "Корень из среднеквадратичной ошибки, сильнее наказывает крупные промахи.",
         "MSE": "Среднеквадратичная ошибка, квадрат единиц, жёстко штрафует большие ошибки.",
-        "R2": "Коэффициент детерминации, ближе к 1 — лучше (может быть отрицательным).",
     }
     metric_options = list(metric_help.keys())
     recommended_metric = metric_rec["metric"] if metric_rec["metric"] in metric_options else "MAE"
-    current_metric = st.session_state.ranking_metric if st.session_state.ranking_metric in metric_options else recommended_metric
-    st.session_state.ranking_metric = st.selectbox(
+
+    # Автоматически ставим рекомендованную метрику, пока пользователь не выбрал вручную
+    if not st.session_state.get("ranking_metric_user_set"):
+        st.session_state.ranking_metric = recommended_metric
+
+    current_metric = (
+        st.session_state.ranking_metric
+        if st.session_state.ranking_metric in metric_options
+        else recommended_metric
+    )
+
+    chosen_metric = st.selectbox(
         "Выберите метрику ранжирования моделей:",
         metric_options,
         index=metric_options.index(current_metric),
+        key="ranking_metric_select",
         help="Используется для сортировки результатов. По умолчанию — рекомендованная системой.",
     )
+    if chosen_metric != st.session_state.ranking_metric:
+        st.session_state.ranking_metric_user_set = True
+    st.session_state.ranking_metric = chosen_metric
     st.info(f"Рекомендуемая метрика: **{recommended_metric}**")
     st.markdown(f"**Пояснение:** {metric_rec['reason']}")
     st.caption("\n".join([f"- **{k}**: {v}" for k, v in metric_help.items()]))
@@ -285,11 +458,16 @@ elif st.session_state.screen == "setup":
     if len(series) < 2 * st.session_state.season_period:
         st.warning(f"Недостаточно данных для анализа сезонности. Требуется как минимум {2 * st.session_state.season_period} точек данных (2 периода), а у вас {len(series)}. График не будет построен.")
     else:
-        try:
-            fig_decomp = plot_decomposition(series, period=st.session_state.season_period)
-            st.plotly_chart(fig_decomp, width='stretch')
-        except Exception as e:
-            st.warning(f"Не удалось построить график декомпозиции: {e}")
+        # Если годовая частота — сезонность обычно отсутствует; пропускаем график
+        freq_str = str(getattr(series, "freq", "")) if hasattr(series, "freq") else ""
+        if freq_str.upper().startswith(("A", "Y")):
+            st.info("Годовая частота обнаружена: график сезонности пропущен.")
+        else:
+            try:
+                fig_decomp = plot_decomposition(series, period=st.session_state.season_period)
+                st.plotly_chart(fig_decomp, width='stretch')
+            except Exception as e:
+                st.warning(f"Не удалось построить график декомпозиции: {e}")
     
     # Настройки подбора гиперпараметров
     st.subheader("⚙️ Настройки обучения моделей")
@@ -355,6 +533,7 @@ elif st.session_state.screen == "results":
             # Определяем частоту для этого датасета тоже
             df_indexed = df_sorted.set_index(time_col).sort_index()
             inferred_freq = pd.infer_freq(df_indexed.index)
+            inferred_freq, monthly_forced = adjust_daily_to_monthly(inferred_freq, df_indexed.index)
             
             if inferred_freq is None and len(df_indexed) > 1:
                 time_diffs = df_indexed.index.to_series().diff().dropna()
@@ -367,15 +546,18 @@ elif st.session_state.screen == "results":
                     elif pd.Timedelta(hours=11) <= median_diff <= pd.Timedelta(hours=13):
                         inferred_freq = 'H'
             
+            inferred_freq, monthly_forced = adjust_daily_to_monthly(inferred_freq, df_indexed.index)
+            
+            df_sorted = normalize_month_start(df_sorted, time_col, inferred_freq)
             # Создаем TimeSeries с правильной частотой
             try:
                 if len(df_sorted) >= 3:
-                    series = TimeSeries.from_dataframe(
-                        df_sorted, 
-                        time_col=time_col, 
-                        value_cols=value_col,
-                        fill_missing_dates=True,
-                        freq=inferred_freq if inferred_freq else None
+                    series = safe_timeseries_from_df(
+                        df_sorted,
+                        time_col=time_col,
+                        value_col=value_col,
+                        freq=inferred_freq if inferred_freq else None,
+                        label="расчётного ряда",
                     ).astype(np.float32)
                     
                     # Убедимся, что частота установлена корректно
@@ -504,9 +686,9 @@ elif st.session_state.screen == "results":
                     future_covariates = None
 
             # Выбор моделей согласно требованиям
-            # Базовые модели (работают без экзогенных): ExponentialSmoothing, LinearRegression, Prophet, AutoARIMA, LightGBM, Theta, CatBoost
+            # Базовые модели (работают без экзогенных): ExponentialSmoothing, LinearRegression, Prophet, AutoARIMA, LightGBM, Theta, CatBoost, N-HiTS, TCN
             # Сложные модели (только с экзогенными): FFT, N-BEATS и другие
-            base_models = ["ExponentialSmoothing", "LinearRegression", "Prophet", "AutoARIMA", "LightGBM", "Theta"]
+            base_models = ["ExponentialSmoothing", "LinearRegression", "Prophet", "AutoARIMA", "LightGBM", "Theta", "N-HiTS", "TCN"]
             # Добавляем CatBoost, если он доступен
             if "CatBoost" in MODELS:
                 base_models.append("CatBoost")
@@ -523,10 +705,47 @@ elif st.session_state.screen == "results":
             total_steps = len(models_to_run) * (2 if st.session_state.use_hyperopt else 1)
             current_step = 0
             
-            # Выводим индикатор прогресса на передний план
-            status_info = st.info("🔄 **Начинаем обучение моделей...**")
-            progress_bar = st.progress(0, text="⏳ Подготовка к обучению моделей...")
-            status_text = st.empty()
+            # Выводим индикатор прогресса как оверлей по центру экрана
+            overlay_placeholder = st.empty()
+
+            def render_overlay(title: str, step_text: str, progress: float):
+                percent = int(progress * 100)
+                overlay_placeholder.markdown(
+                    f"""
+                    <div style="
+                        position: fixed; inset: 0;
+                        background: rgba(0, 0, 0, 0.55);
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        z-index: 9999;">
+                        <div style="
+                            background: #0b1221;
+                            color: #e5e7eb;
+                            padding: 22px 26px;
+                            border-radius: 18px;
+                            width: min(420px, 90%);
+                            box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+                            font-family: 'Inter', system-ui, -apple-system, sans-serif;">
+                            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                                <span style="font-size: 18px; font-weight: 700;">{title}</span>
+                                <span style="font-size: 14px; opacity: 0.8;">{percent}%</span>
+                            </div>
+                            <div style="font-size: 14px; margin-bottom: 12px; line-height: 1.5;">{step_text}</div>
+                            <div style="background: rgba(255,255,255,0.08); border-radius: 999px; height: 12px; overflow: hidden;">
+                                <div style="
+                                    width: {percent}%;
+                                    height: 100%;
+                                    background: linear-gradient(90deg, #22d3ee, #6366f1);
+                                    transition: width 180ms ease-out;"></div>
+                            </div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            render_overlay("Начинаем обучение моделей", "⏳ Подготовка к обучению...", 0)
             
             for name, model_info in models_to_run.items():
                 # Проверка совместимости модели с экзогенными переменными
@@ -539,8 +758,11 @@ elif st.session_state.screen == "results":
                 if st.session_state.use_hyperopt:
                     current_step += 1
                     progress = current_step / total_steps
-                    progress_bar.progress(progress, text=f"🔍 Подбор гиперпараметров: {name}")
-                    status_text.info(f"**Текущий этап:** Подбор гиперпараметров для модели {name} ({current_step}/{total_steps})")
+                    render_overlay(
+                        "Подбор гиперпараметров",
+                        f"🔍 {name}: поиск лучших настроек ({current_step}/{total_steps})",
+                        progress,
+                    )
                     best_params, opt_error = optimize_hyperparameters(
                         model_name=name,
                         train_series=train,
@@ -559,8 +781,11 @@ elif st.session_state.screen == "results":
                 # Обучение модели
                 current_step += 1
                 progress = current_step / total_steps
-                progress_bar.progress(progress, text=f"🚀 Обучается: {name}")
-                status_text.info(f"**Текущий этап:** Обучение модели {name} ({current_step}/{total_steps})")
+                render_overlay(
+                    "Обучение моделей",
+                    f"🚀 {name}: запуск обучения ({current_step}/{total_steps})",
+                    progress,
+                )
                 
                 forecast, model, error = train_model(
                     model_name=name, 
@@ -622,17 +847,16 @@ elif st.session_state.screen == "results":
                 forecasts[name] = forecast
                 trained_models[name] = model
             
-            progress_bar.empty()
-            status_text.empty()
-            status_info.empty()  # Убираем информационное сообщение о начале обучения
+            overlay_placeholder.empty()  # Убираем оверлей после завершения
             st.success("✅ Обучение всех моделей завершено!")
 
             if not results_list:
+                overlay_placeholder.empty()
                 st.error("Ни одна модель не смогла быть обучена."); st.stop()
 
             results_df = pd.DataFrame(results_list).set_index("Модель")
             # Если выбранная метрика вся NaN, пробуем подобрать другую, но не останавливаем выполнение
-            metric_priority = ["MAE", "RMSE", "MAPE", "MSE", "R2"]
+            metric_priority = ["MAE", "RMSE", "MAPE", "MSE"]
             non_nan_metrics = [m for m in metric_priority if m in results_df.columns and results_df[m].notna().any()]
             if not non_nan_metrics:
                 st.warning("Ни одна модель не рассчитала метрики (все значения NaN). Показаны результаты как есть. Ниже подробности по моделям.")
@@ -687,6 +911,8 @@ elif st.session_state.screen == "results":
             st.session_state.final_forecast = final_forecast
 
         except Exception as e:
+            if "overlay_placeholder" in locals():
+                overlay_placeholder.empty()
             st.error(f"Произошла критическая ошибка на этапе выполнения: {e}")
             st.exception(e)
             st.stop()
@@ -738,7 +964,7 @@ elif st.session_state.screen == "results":
                         plot_freq = 'M'
                     elif pd.Timedelta(hours=11) <= median_diff <= pd.Timedelta(hours=13):
                         plot_freq = 'H'
-            
+
             # Ensure the time column is in datetime format
             time_col = st.session_state.time_col
             value_col = st.session_state.value_col
@@ -753,6 +979,8 @@ elif st.session_state.screen == "results":
             # Set the time column as index
             plot_df = plot_df.set_index(time_col).sort_index()
             
+            plot_freq, plot_monthly_forced = adjust_daily_to_monthly(plot_freq, plot_df.index)
+
             # Try to infer frequency if not provided
             if not plot_freq:
                 try:
@@ -776,23 +1004,14 @@ elif st.session_state.screen == "results":
                     plot_freq = None
             
             # Create TimeSeries with inferred frequency
-            try:
-                series_to_plot = TimeSeries.from_dataframe(
-                    plot_df.reset_index(), 
-                    time_col=time_col, 
-                    value_cols=value_col,
-                    fill_missing_dates=True,
-                    freq=plot_freq
-                ).astype(np.float32)
-            except Exception as e:
-                # Fallback without frequency if there's an error
-                st.warning(f"Could not set frequency for plotting: {e}. Plotting without frequency.")
-                series_to_plot = TimeSeries.from_dataframe(
-                    plot_df.reset_index(), 
-                    time_col=time_col, 
-                    value_cols=value_col,
-                    fill_missing_dates=False
-                ).astype(np.float32)
+            plot_df_reset = normalize_month_start(plot_df.reset_index(), time_col, plot_freq)
+            series_to_plot = safe_timeseries_from_df(
+                plot_df_reset,
+                time_col=time_col,
+                value_col=value_col,
+                freq=plot_freq,
+                label="графика тестового прогноза",
+            ).astype(np.float32)
             val_size_plot = st.session_state.get("val_size", st.session_state.n_forecast)
             train_plot, val_plot = series_to_plot[:-val_size_plot], series_to_plot[-val_size_plot:]
             
@@ -849,21 +1068,24 @@ elif st.session_state.screen == "results":
                     final_freq = 'Q'  # Quarterly
                 elif pd.Timedelta(days=300) <= median_diff <= pd.Timedelta(days=400):
                     final_freq = 'A'  # Yearly
+
+        final_freq, final_monthly_forced = adjust_daily_to_monthly(final_freq, plot_df.index)
         
         # Create TimeSeries with inferred frequency
         try:
-            series_full = TimeSeries.from_dataframe(
-                plot_df.reset_index(),
+            plot_df_reset = normalize_month_start(plot_df.reset_index(), time_col, final_freq)
+            series_full = safe_timeseries_from_df(
+                plot_df_reset,
                 time_col=time_col,
-                value_cols=value_col,
-                fill_missing_dates=True,
-                freq=final_freq if final_freq else None
+                value_col=value_col,
+                freq=final_freq if final_freq else None,
+                label="финального прогноза",
             ).astype(np.float32)
         except Exception as e:
             # Fallback without frequency if there's an error
             st.warning(f"Could not set frequency for final forecast plot: {e}. Plotting without frequency.")
             series_full = TimeSeries.from_dataframe(
-                plot_df.reset_index(),
+                plot_df_reset,
                 time_col=time_col,
                 value_cols=value_col,
                 fill_missing_dates=False
