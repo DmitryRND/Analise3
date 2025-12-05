@@ -8,6 +8,10 @@ import warnings
 import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit.components.v1 as components
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
 import time
 import os
 
@@ -94,6 +98,10 @@ def render_resource_panel(start_time=None):
     """Показываем быструю информацию о ресурсах в сайдбаре."""
     with st.sidebar:
         st.markdown("### Мониторинг")
+        refresh_btn = st.button("Обновить монитор", key="refresh_monitor")
+        auto_refresh = st.checkbox("Автообновление (5 сек)", key="monitor_auto_refresh")
+        if auto_refresh and st_autorefresh:
+            st_autorefresh(interval=5000, key="monitor_autorefresh_key", limit=None)
         if psutil:
             proc = psutil.Process()
             cpu = psutil.cpu_percent(interval=0.1)
